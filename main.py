@@ -107,6 +107,25 @@ class OIMonitor:
         # 获取Ticker和Funding
         t_resp = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10).json()
         p_resp = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=10).json()
+        
+        # --- 错误处理补丁 START ---
+        if not isinstance(t_resp, list):
+            logger.error(f"Ticker API error: {t_resp}")
+            return {
+                "message": f"⚠️ 扫描失败: 币安API返回错误\n`{t_resp}`\n(可能是GitHub IP被限制)",
+                "coins": {},
+                "timestamp": datetime.now().isoformat()
+            }
+        
+        if not isinstance(p_resp, list):
+            logger.error(f"Premium API error: {p_resp}")
+            return {
+                "message": f"⚠️ 扫描失败: 资金费率API返回错误\n`{p_resp}`",
+                "coins": {},
+                "timestamp": datetime.now().isoformat()
+            }
+        # --- 错误处理补丁 END ---
+
         premiums = {p['symbol']: p for p in p_resp}
 
         # 筛选USDT活跃交易对
