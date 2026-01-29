@@ -74,16 +74,74 @@ class OIMonitor:
     def __init__(self, bot_token, chat_id):
         self.bot_token = bot_token
         self.chat_id = chat_id
+        self.proxies = []
+        self.proxy_index = 0
+
+    def get_public_proxies(self):
+        """从公共源获取最新代理列表"""
+        if self.proxies: return
+        try:
+            logger.info("正在获取公共代理列表...")
+            # 使用 reliable 的 GitHub 代理列表源
+            url = "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                # 只取前50个，避免太久
+                all_proxies = resp.text.splitlines()[:50]
+                self.proxies = [{"http": f"http://{p}", "https": f"http://{p}"} for p in all_proxies]
+                logger.info(f"成功获取 {len(self.proxies)} 个代理")
+        except Exception as e:
+            logger.error(f"获取代理失败: {e}")
+
+    def request_with_retry(self, url):
+        """带代理重试的请求封装"""
+        # 1. 先尝试直连
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                # 检查是否是 API 错误响应 (dict 且包含 code/msg)
+                if isinstance(data, dict) and ('code' in data or 'msg' in data):
+                     # 如果是 IP 限制，抛出异常进入代理重试
+                     if "restricted" in str(data.get('msg', '')):
+                         raise ValueError("IP Restricted")
+                return data
+        except Exception as e:
+            logger.warning(f"直连失败 ({e})，尝试使用代理...")
+
+        # 2. 直连失败，准备代理
+        self.get_public_proxies()
+        
+        # 3. 遍历代理尝试
+        max_retries = 10  # 最多试10个代理
+        for i in range(min(len(self.proxies), max_retries)):
+            proxy = self.proxies[i]
+            try:
+                logger.info(f"正在尝试代理 [{i+1}/{max_retries}]...")
+                resp = requests.get(url, proxies=proxy, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                     # 再次检查内容有效性
+                    if isinstance(data, dict) and 'code' in data:
+                        continue # 这个代理也被墙了，换下一个
+                    return data
+            except:
+                continue
+        
+        # 全都失败
+        return None
 
     def get_real_oi_growth(self, symbol: str):
         try:
             # 获取当前OI
-            curr_resp = requests.get(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}", timeout=10).json()
-            oi_now = float(curr_resp['openInterest'])
+            oi_resp = self.request_with_retry(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}")
+            if not oi_resp or 'openInterest' not in oi_resp:
+                return 0, 0, 1.0
+            oi_now = float(oi_resp['openInterest'])
             
-            # 获取历史OI (5分钟k线，取前几个点算30分钟前)
+            # 获取历史OI
             hist_url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=7"
-            hist_resp = requests.get(hist_url, timeout=10).json()
+            hist_resp = self.request_with_retry(hist_url)
             
             if not hist_resp or not isinstance(hist_resp, list):
                 return oi_now, 0, 1.0
@@ -93,7 +151,7 @@ class OIMonitor:
 
             # LS Ratio
             ls_url = f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={symbol}&period=30m&limit=1"
-            ls_resp = requests.get(ls_url, timeout=10).json()
+            ls_resp = self.request_with_retry(ls_url)
             ls_ratio = float(ls_resp[0]['longShortRatio']) if ls_resp else 1.0
 
             return oi_now, oi_growth, ls_ratio
@@ -105,26 +163,24 @@ class OIMonitor:
         """扫描市场并返回结构化数据和报告文本"""
         logger.info("开始币安OI扫描...")
         # 获取Ticker和Funding
-        t_resp = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10).json()
-        p_resp = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=10).json()
+        t_resp = self.request_with_retry("https://fapi.binance.com/fapi/v1/ticker/24hr")
+        p_resp = self.request_with_retry("https://fapi.binance.com/fapi/v1/premiumIndex")
         
-        # --- 错误处理补丁 START ---
-        if not isinstance(t_resp, list):
-            logger.error(f"Ticker API error: {t_resp}")
+        if not t_resp or not isinstance(t_resp, list):
+            msg = f"⚠️ 扫描失败: 币安API连接错误 (已重试)\n(所有代理尝试均失败或IP仍受限)"
+            if isinstance(t_resp, dict): msg += f"\n`{str(t_resp)[:100]}...`"
             return {
-                "message": f"⚠️ 扫描失败: 币安API返回错误\n`{t_resp}`\n(可能是GitHub IP被限制)",
+                "message": msg,
                 "coins": {},
                 "timestamp": datetime.now().isoformat()
             }
         
-        if not isinstance(p_resp, list):
-            logger.error(f"Premium API error: {p_resp}")
-            return {
-                "message": f"⚠️ 扫描失败: 资金费率API返回错误\n`{p_resp}`",
+        if not p_resp or not isinstance(p_resp, list):
+             return {
+                "message": f"⚠️ 扫描失败: 资金费率API连接错误",
                 "coins": {},
                 "timestamp": datetime.now().isoformat()
             }
-        # --- 错误处理补丁 END ---
 
         premiums = {p['symbol']: p for p in p_resp}
 
