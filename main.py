@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import firebase_admin
 from firebase_admin import credentials
@@ -215,7 +215,8 @@ class OIMonitor:
         ext_pos = sorted([d for d in all_metrics if d['funding'] > 0], key=lambda x: x['funding'], reverse=True)[:3]
 
         # 构造报告文本
-        msg = f"🛰️ **【{datetime.now().strftime('%H:%M')} 真实持仓扫描 (GHA版)】**\n\n"
+        beijing_time = datetime.utcnow() + timedelta(hours=8)
+        msg = f"🛰️ **【{beijing_time.strftime('%H:%M')} 真实持仓扫描 (GHA版)】**\n\n"
         
         msg += "💎 **低位埋伏 (横盘+OI增+大户多)**\n"
         if not accumulation: msg += "• 暂无匹配\n"
