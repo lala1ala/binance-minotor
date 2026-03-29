@@ -159,6 +159,29 @@ class OIMonitor:
             logger.error(f"Error fetching {symbol}: {e}")
             return 0, 0, 1.0
 
+    def get_cvd_30m_usdt(self, symbol: str):
+        """计算过去30分钟的主动买卖净差值 (CVD)，以 USDT 计价"""
+        try:
+            # 获取过去30分钟的 5m K线 (limit=6)
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=6"
+            resp = self.request_with_retry(url)
+            if not resp or not isinstance(resp, list):
+                return 0.0
+            
+            net_delta_usdt = 0.0
+            for k in resp:
+                quote_vol = float(k[7]) # 总USDT交易量
+                taker_buy_usdt = float(k[10]) # 主动买入的USDT量
+                taker_sell_usdt = quote_vol - taker_buy_usdt # 主动卖出的USDT量
+                delta = taker_buy_usdt - taker_sell_usdt
+                
+                net_delta_usdt += delta
+                
+            return net_delta_usdt
+        except Exception as e:
+            logger.error(f"Error fetching CVD for {symbol}: {e}")
+            return 0.0
+
     def scan_and_collect(self) -> Dict:
         """扫描市场并返回结构化数据和报告文本"""
         logger.info("开始币安OI扫描...")
@@ -197,6 +220,7 @@ class OIMonitor:
         for t in active_tickers:
             s = t['symbol']
             oi_val, oi_chg, ls = self.get_real_oi_growth(s)
+            cvd_usdt = self.get_cvd_30m_usdt(s)
             funding = float(premiums[s]['lastFundingRate']) * 100 if s in premiums else 0
             
             data_point = {
@@ -204,29 +228,44 @@ class OIMonitor:
                 "price_chg": float(t['priceChangePercent']),
                 "oi_chg": oi_chg,
                 "ls": ls,
+                "cvd_usdt": cvd_usdt,
                 "funding": funding
             }
             all_metrics.append(data_point)
 
         # 筛选逻辑
-        accumulation = [d for d in all_metrics if -2 < d['price_chg'] < 5 and d['oi_chg'] > 1.5 and d['ls'] > 1.2]
+        # 低位埋伏: 价格未暴涨(-2%到5%), OI增加, 大户多, 且CVD纯买入>0
+        accumulation = [d for d in all_metrics if -2 < d['price_chg'] < 5 and d['oi_chg'] > 1.5 and d['ls'] > 1.2 and d['cvd_usdt'] > 0]
         top_oi = sorted(all_metrics, key=lambda x: x['oi_chg'], reverse=True)[:5]
         ext_neg = sorted([d for d in all_metrics if d['funding'] < 0], key=lambda x: x['funding'])[:3]
         ext_pos = sorted([d for d in all_metrics if d['funding'] > 0], key=lambda x: x['funding'], reverse=True)[:3]
+
+        # 金额格式化小工具
+        def format_usd(val):
+            abs_val = abs(val)
+            if abs_val >= 1_000_000:
+                fmt = f"{abs_val/1_000_000:.2f}M"
+            elif abs_val >= 1_000:
+                fmt = f"{abs_val/1_000:.1f}K"
+            else:
+                fmt = f"{abs_val:.0f}"
+            return "+$" + fmt if val > 0 else "-$" + fmt
 
         # 构造报告文本
         beijing_time = datetime.utcnow() + timedelta(hours=8)
         msg = f"🛰️ **【{beijing_time.strftime('%H:%M')} 真实持仓扫描 (GHA版)】**\n\n"
         
-        msg += "💎 **低位埋伏 (横盘+OI增+大户多)**\n"
+        msg += "💎 **低位埋伏 (横盘+OI增+大户多+CVD净买入)**\n"
         if not accumulation: msg += "• 暂无匹配\n"
         for d in accumulation:
-            msg += f"• `{d['symbol']}`: OI:+{d['oi_chg']:.1f}% | LS:{d['ls']:.2f}\n"
+            cvd_str = format_usd(d['cvd_usdt'])
+            msg += f"• `{d['symbol']}`: OI:+{d['oi_chg']:.1f}% | LS:{d['ls']:.2f} | CVD:{cvd_str}\n"
             structured_coins[d['symbol']] = {"ls_value": d['ls'], "section": "accumulation", "extra_info": ""}
 
         msg += "\n📈 **30min OI 爆增榜**\n"
         for d in top_oi:
-            msg += f"• `{d['symbol']}`: +{d['oi_chg']:.1f}% | LS:{d['ls']:.2f} | F:{d['funding']:.3f}%\n"
+            cvd_str = format_usd(d['cvd_usdt'])
+            msg += f"• `{d['symbol']}`: OI:+{d['oi_chg']:.1f}% | CVD:{cvd_str} | LS:{d['ls']:.2f}\n"
             # 如果币种重复，优先保留accumulation的分类，否则覆盖
             if d['symbol'] not in structured_coins:
                 structured_coins[d['symbol']] = {"ls_value": d['ls'], "section": "top_oi", "extra_info": f"F:{d['funding']:.3f}%"}
