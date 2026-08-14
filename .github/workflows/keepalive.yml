@@ -1,0 +1,31 @@
+name: Keep Workflows Alive
+
+on:
+  schedule:
+    # 每月 1 号 UTC 00:00 运行一次，push 一个空 commit 重置 GitHub 的 60 天不活动计时器
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Update keepalive timestamp
+        run: |
+          date -u > .github/.keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/.keepalive
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: monthly keepalive [skip ci]"
+            git push
+          fi
