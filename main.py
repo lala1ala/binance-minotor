@@ -195,6 +195,7 @@ class OIMonitor:
             return {
                 "message": msg,
                 "coins": {},
+                "all_metrics": [],
                 "timestamp": datetime.now().isoformat()
             }
         
@@ -202,6 +203,7 @@ class OIMonitor:
              return {
                 "message": f"⚠️ 扫描失败: 资金费率API连接错误",
                 "coins": {},
+                "all_metrics": [],
                 "timestamp": datetime.now().isoformat()
             }
 
@@ -225,7 +227,9 @@ class OIMonitor:
             
             data_point = {
                 "symbol": s,
+                "price": float(t['lastPrice']),
                 "price_chg": float(t['priceChangePercent']),
+                "oi_value": oi_val,
                 "oi_chg": oi_chg,
                 "ls": ls,
                 "cvd_usdt": cvd_usdt,
@@ -279,6 +283,7 @@ class OIMonitor:
         return {
             "message": msg,
             "coins": structured_coins,
+            "all_metrics": all_metrics,
             "timestamp": datetime.now().isoformat()
         }
 
@@ -333,19 +338,205 @@ class LSAnalyzer:
             msg += f"   • 出现次数: {r['count']}\n"
         return msg
 
+# ==================== OI 持续升温追踪 ====================
+def format_usd(val):
+    """将USDT金额格式化为 +$1.2M / -$3.4K 形式"""
+    if val == 0:
+        return "$0"
+    abs_val = abs(val)
+    if abs_val >= 1_000_000:
+        fmt = f"{abs_val/1_000_000:.2f}M"
+    elif abs_val >= 1_000:
+        fmt = f"{abs_val/1_000:.1f}K"
+    else:
+        fmt = f"{abs_val:.0f}"
+    return ("+$" if val > 0 else "-$") + fmt
+
+
+class WarmupTracker:
+    """OI持续升温追踪器：按天聚合存储快照，并检测左侧慢牛候选"""
+
+    COLLECTION = 'oi_warmup_tracker'
+    DOC_ID = 'daily_snapshots'
+    MAX_DAYS = 5
+    MIN_DAYS = 3
+
+    def __init__(self, db):
+        self.db = db
+        self.doc_ref = self.db.collection(self.COLLECTION).document(self.DOC_ID)
+
+    def store_daily_snapshot(self, all_metrics: List[Dict]) -> None:
+        """存储当天所有币种快照，按天聚合（保留最后一次），仅保留最近5天"""
+        if not all_metrics:
+            return
+
+        date_str = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+        day_data = {
+            m['symbol']: {
+                "oi": m.get('oi_value', 0),
+                "price": m.get('price', 0),
+                "ls": m.get('ls', 1.0),
+                "cvd": m.get('cvd_usdt', 0),
+                "fr": m.get('funding', 0),
+            }
+            for m in all_metrics
+        }
+
+        doc = self.doc_ref.get()
+        snapshots = doc.to_dict().get('snapshots', []) if doc.exists else []
+
+        # 当天已存在则覆盖（保留最后一次），否则追加
+        for s in snapshots:
+            if s.get('date') == date_str:
+                s['data'] = day_data
+                break
+        else:
+            snapshots.append({"date": date_str, "data": day_data})
+
+        # 按日期排序，仅保留最近MAX_DAYS天
+        snapshots.sort(key=lambda x: x.get('date', ''))
+        snapshots = snapshots[-self.MAX_DAYS:]
+
+        self.doc_ref.set({'snapshots': snapshots})
+        logger.info(f"OI升温快照已存储，当前保留 {len(snapshots)} 天")
+
+    def get_history(self) -> List[Dict]:
+        doc = self.doc_ref.get()
+        if doc.exists:
+            return doc.to_dict().get('snapshots', [])
+        return []
+
+    def detect_warmup(self, snapshots: List[Dict], accumulation_symbols: set) -> List[Dict]:
+        """检测OI持续升温候选，需≥3天数据才激活"""
+        if len(snapshots) < self.MIN_DAYS:
+            return []
+
+        snapshots = sorted(snapshots, key=lambda x: x.get('date', ''))
+        latest_data = snapshots[-1].get('data', {})
+        results = []
+
+        for symbol in latest_data:
+            series = []
+            for s in snapshots:
+                d = s.get('data', {})
+                if symbol in d:
+                    series.append(d[symbol])
+
+            if len(series) < self.MIN_DAYS:
+                continue
+
+            oi_values = [p.get('oi', 0) for p in series]
+            price_values = [p.get('price', 0) for p in series]
+
+            # 1) 最近≥3天 OI 在增长（当天 > 前一天）
+            up_days = sum(1 for i in range(1, len(oi_values)) if oi_values[i] > oi_values[i - 1])
+            if up_days < 3:
+                continue
+
+            # 2) OI整体趋势向上（末日 > 首日，且涨幅 > 5%）
+            first_oi, last_oi = oi_values[0], oi_values[-1]
+            if first_oi <= 0 or last_oi <= first_oi:
+                continue
+            oi_change = (last_oi - first_oi) / first_oi * 100
+            if oi_change <= 5:
+                continue
+
+            # 3) 价格5天涨幅 < 15%（过滤已拉完的）
+            first_price, last_price = price_values[0], price_values[-1]
+            if first_price <= 0:
+                continue
+            price_change = (last_price - first_price) / first_price * 100
+            if price_change >= 15:
+                continue
+
+            # 4) 价格距5天最低点反弹 < 10%（确认"刚开始"）
+            min_price = min(price_values)
+            if min_price <= 0:
+                continue
+            rebound = (last_price - min_price) / min_price * 100
+            if rebound >= 10:
+                continue
+
+            latest = series[-1]
+            flags = []
+            if latest.get('ls', 1.0) > 1.1:
+                flags.append('🟢')  # 大户偏多
+            if latest.get('cvd', 0) > 0:
+                flags.append('🟢')  # 买压主导
+            if latest.get('fr', 0) < 0:
+                flags.append('💎')  # 逆势信号（空头付费）
+            if symbol in accumulation_symbols:
+                flags.append('⭐')  # 双重确认
+
+            results.append({
+                "symbol": symbol,
+                "flags": "".join(flags),
+                "oi_change": oi_change,
+                "up_days": up_days,
+                "total_days": len(series),
+                "price_change": price_change,
+                "rebound": rebound,
+                "ls": latest.get('ls', 1.0),
+                "cvd": latest.get('cvd', 0),
+                "fr": latest.get('fr', 0),
+            })
+
+        results.sort(key=lambda x: x['oi_change'], reverse=True)
+        return results
+
+    def _conclusion(self, d: Dict) -> str:
+        parts = ["OI稳步攀升", "价格未启动"]
+        if d['fr'] < 0:
+            parts.append("负费率")
+        if d['ls'] > 1.1:
+            parts.append("大户偏多")
+        if d['cvd'] > 0:
+            parts.append("买压主导")
+        return f"  ⚡ {'+'.join(parts)} = 强左侧\n"
+
+    def format_message(self, results: List[Dict]) -> str:
+        if not results:
+            return ""
+
+        msg = f"🔥 **【OI持续升温 (左侧慢牛候选)】**\n发现 {len(results)} 个OI缓慢攀升+价格未暴涨的标的：\n\n"
+        for d in results:
+            cvd_str = format_usd(d['cvd'])
+            msg += f"• `{d['symbol']}` {d['flags']}\n"
+            msg += f"  OI 5日变化: {d['oi_change']:+.1f}% ({d['up_days']}/{d['total_days']}天上涨)\n"
+            msg += f"  Price 5日变化: {d['price_change']:+.1f}% (距低点{d['rebound']:+.1f}%)\n"
+            msg += f"  LS: {d['ls']:.2f} | CVD: {cvd_str} | FR: {d['fr']:.3f}%\n"
+            msg += self._conclusion(d)
+            msg += "\n"
+        return msg
+
+    def warmup_scan(self, all_metrics: List[Dict], accumulation_symbols: set) -> str:
+        """存储每日快照并检测持续升温，返回Telegram消息片段（无候选返回空串）"""
+        self.store_daily_snapshot(all_metrics)
+        snapshots = self.get_history()
+        results = self.detect_warmup(snapshots, accumulation_symbols)
+        return self.format_message(results)
+
 # ==================== 主入口 ====================
 def main():
     try:
         config = Config()
         fb = FirebaseManager(config.firebase_creds_json)
         monitor = OIMonitor(config.bot_token, config.chat_id)
+        warmup = WarmupTracker(fb.db)
 
-        # 1. 扫描并发送 OI 报告
+        # 1. 扫描并收集数据
         scan_result = monitor.scan_and_collect()
-        monitor.send_telegram(scan_result['message'])
+
+        # 2. OI持续升温检测（存储每日快照 + 检测左侧慢牛候选）
+        accumulation_symbols = {sym for sym, d in scan_result['coins'].items() if d.get('section') == 'accumulation'}
+        warmup_msg = warmup.warmup_scan(scan_result.get('all_metrics', []), accumulation_symbols)
+
+        # 3. 拼接并发送报告（升温板块在最前面）
+        full_msg = (warmup_msg.rstrip() + "\n\n" + scan_result['message']) if warmup_msg else scan_result['message']
+        monitor.send_telegram(full_msg)
         logger.info("OI 报告发送成功")
 
-        # 2. 保存数据到 Firebase
+        # 4. 保存数据到 Firebase
         report_record = {
             "timestamp": scan_result['timestamp'],
             "coins": scan_result['coins']
@@ -353,7 +544,7 @@ def main():
         cycle_len = fb.add_report_to_cycle(report_record)
         logger.info(f"数据已保存，当前周期进度: {cycle_len}/{config.report_cycle}")
 
-        # 3. 检查是否需要分析
+        # 5. 检查是否需要分析
         if cycle_len >= config.report_cycle:
             logger.info("达到周期，开始LS分析...")
             previous_reports = fb.get_current_cycle()
