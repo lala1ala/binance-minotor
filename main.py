@@ -139,18 +139,18 @@ class OIMonitor:
                 return 0, 0, 1.0
             oi_now = float(oi_resp['openInterest'])
             
-            # 获取历史OI
-            hist_url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=7"
+            # 获取历史OI（过去2小时）
+            hist_url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=2h&limit=2"
             hist_resp = self.request_with_retry(hist_url)
             
             if not hist_resp or not isinstance(hist_resp, list):
                 return oi_now, 0, 1.0
 
-            oi_30m_ago = float(hist_resp[0]['sumOpenInterest'])
-            oi_growth = ((oi_now - oi_30m_ago) / oi_30m_ago) * 100 if oi_30m_ago > 0 else 0
+            oi_2h_ago = float(hist_resp[0]['sumOpenInterest'])
+            oi_growth = ((oi_now - oi_2h_ago) / oi_2h_ago) * 100 if oi_2h_ago > 0 else 0
 
-            # LS Ratio
-            ls_url = f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={symbol}&period=30m&limit=1"
+            # LS Ratio（过去2小时）
+            ls_url = f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={symbol}&period=2h&limit=1"
             ls_resp = self.request_with_retry(ls_url)
             ls_ratio = float(ls_resp[0]['longShortRatio']) if ls_resp else 1.0
 
@@ -159,11 +159,11 @@ class OIMonitor:
             logger.error(f"Error fetching {symbol}: {e}")
             return 0, 0, 1.0
 
-    def get_cvd_30m_usdt(self, symbol: str):
-        """计算过去30分钟的主动买卖净差值 (CVD)，以 USDT 计价"""
+    def get_cvd_2h_usdt(self, symbol: str):
+        """计算过去2小时的主动买卖净差值 (CVD)，以 USDT 计价"""
         try:
-            # 获取过去30分钟的 5m K线 (limit=6)
-            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=6"
+            # 获取过去2小时的 5m K线 (limit=24)
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=24"
             resp = self.request_with_retry(url)
             if not resp or not isinstance(resp, list):
                 return 0.0
@@ -222,7 +222,7 @@ class OIMonitor:
         for t in active_tickers:
             s = t['symbol']
             oi_val, oi_chg, ls = self.get_real_oi_growth(s)
-            cvd_usdt = self.get_cvd_30m_usdt(s)
+            cvd_usdt = self.get_cvd_2h_usdt(s)
             funding = float(premiums[s]['lastFundingRate']) * 100 if s in premiums else 0
             
             data_point = {
@@ -266,7 +266,7 @@ class OIMonitor:
             msg += f"• `{d['symbol']}`: OI:+{d['oi_chg']:.1f}% | LS:{d['ls']:.2f} | CVD:{cvd_str}\n"
             structured_coins[d['symbol']] = {"ls_value": d['ls'], "section": "accumulation", "extra_info": ""}
 
-        msg += "\n📈 **30min OI 爆增榜**\n"
+        msg += "\n📈 **2h OI 爆增榜**\n"
         for d in top_oi:
             cvd_str = format_usd(d['cvd_usdt'])
             msg += f"• `{d['symbol']}`: OI:+{d['oi_chg']:.1f}% | CVD:{cvd_str} | LS:{d['ls']:.2f}\n"
