@@ -14,6 +14,7 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
+          cache: 'pip'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -21,4 +22,5 @@ jobs:
       - name: Run backfill
         env:
           FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
+          PYTHONUNBUFFERED: "1"
         run: python backfill_top25.py
