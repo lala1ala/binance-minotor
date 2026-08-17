@@ -24,7 +24,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 FAPI = "https://fapi.binance.com"
-VOLUME_THRESHOLD = 10_000_000   # 与 main.py 一致：24h成交额 > $10M
+VOLUME_THRESHOLD = 5_000_000   # 与 warmup 模式一致：24h成交额 > $5M
 BACKFILL_DAYS = 5    # 回填最近 5 天
 COLLECTION = "oi_warmup_tracker"
 DOC_ID = "daily_snapshots"
