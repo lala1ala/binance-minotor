@@ -82,7 +82,11 @@ def get_daily_history(symbol, days=6):
     if isinstance(oi_hist, list):
         for r in oi_hist:
             ts = datetime.fromtimestamp(r['timestamp'] / 1000).strftime('%m-%d')
-            oi_rows.append((ts, float(r['sumOpenInterest'])))
+            # 优先用官方美元名义价值，缺失时回退到合约张数
+            usd = r.get('sumOpenInterestValue')
+            if usd is None:
+                usd = r.get('sumOpenInterest', 0)
+            oi_rows.append((ts, float(usd)))
 
     k_rows = []
     if isinstance(klines, list):
@@ -125,9 +129,9 @@ def main():
 
         print(f"\n[{t}] 当前 OI 排名: #{rank if rank else '未进前'}{UNIVERSE_SIZE}")
         if oi_rows:
-            print("  每日 OI:")
+            print("  每日 OI (USD):")
             for ts, v in oi_rows:
-                print(f"    {ts}: {v:,.0f}")
+                print(f"    {ts}: ${v:,.0f}")
         if k_rows:
             print("  每日收盘:")
             for ts, v in k_rows:
