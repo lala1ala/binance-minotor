@@ -6,6 +6,10 @@ on:
     - cron: '0 */2 * * *'
   workflow_dispatch: # 允许手动点击运行测试
 
+concurrency:
+  group: binance-monitor
+  cancel-in-progress: false
+
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
