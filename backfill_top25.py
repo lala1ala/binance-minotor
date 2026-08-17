@@ -24,7 +24,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 FAPI = "https://fapi.binance.com"
-UNIVERSE_SIZE = 50   # 与 main.py 一致：成交额前 50 的 USDT 永续
+VOLUME_THRESHOLD = 10_000_000   # 与 main.py 一致：24h成交额 > $10M
 BACKFILL_DAYS = 5    # 回填最近 5 天
 COLLECTION = "oi_warmup_tracker"
 DOC_ID = "daily_snapshots"
@@ -72,9 +72,12 @@ def get_top_symbols():
     tickers = request_json("/fapi/v1/ticker/24hr")
     if not tickers or not isinstance(tickers, list):
         return []
-    usdt = [t for t in tickers if t.get('symbol', '').endswith('USDT')]
+    usdt = [
+        t for t in tickers
+        if t.get('symbol', '').endswith('USDT') and float(t.get('quoteVolume', 0)) > VOLUME_THRESHOLD
+    ]
     usdt.sort(key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)
-    return [t['symbol'] for t in usdt[:UNIVERSE_SIZE]]
+    return [t['symbol'] for t in usdt]
 
 
 def build_backfill_days():

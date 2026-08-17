@@ -209,12 +209,12 @@ class OIMonitor:
 
         premiums = {p['symbol']: p for p in p_resp}
 
-        # 筛选USDT活跃交易对
-        active_tickers = sorted(
-            [t for t in t_resp if t['symbol'].endswith("USDT")],
-            key=lambda x: float(x['quoteVolume']),
-            reverse=True
-        )[:50]
+        # 筛选USDT活跃交易对：24h成交额 > $10M（约150个，覆盖主要活跃合约）
+        active_tickers = [
+            t for t in t_resp
+            if t['symbol'].endswith("USDT") and float(t['quoteVolume']) > 10_000_000
+        ]
+        active_tickers.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
 
         all_metrics = []
         structured_coins = {} # 用于存入数据库
