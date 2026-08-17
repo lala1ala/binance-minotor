@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import logging
 import requests
@@ -182,7 +183,17 @@ class OIMonitor:
             logger.error(f"Error fetching CVD for {symbol}: {e}")
             return 0.0
 
-    def scan_and_collect(self) -> Dict:
+    def get_light_oi(self, symbol: str) -> float:
+        """轻量获取当前 OI（合约张数）"""
+        try:
+            oi_resp = self.request_with_retry(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}")
+            if oi_resp and 'openInterest' in oi_resp:
+                return float(oi_resp['openInterest'])
+        except Exception as e:
+            logger.error(f"Error fetching light OI {symbol}: {e}")
+        return 0.0
+
+    def scan_and_collect(self, threshold: float = 10_000_000) -> Dict:
         """扫描市场并返回结构化数据和报告文本"""
         logger.info("开始币安OI扫描...")
         # 获取Ticker和Funding
@@ -212,7 +223,7 @@ class OIMonitor:
         # 筛选USDT活跃交易对：24h成交额 > $10M（约150个，覆盖主要活跃合约）
         active_tickers = [
             t for t in t_resp
-            if t['symbol'].endswith("USDT") and float(t['quoteVolume']) > 10_000_000
+            if t['symbol'].endswith("USDT") and float(t['quoteVolume']) > threshold
         ]
         active_tickers.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
 
@@ -287,6 +298,42 @@ class OIMonitor:
             "timestamp": datetime.now().isoformat()
         }
 
+    def scan_light(self, threshold: float = 5_000_000) -> List[Dict]:
+        """轻量扫描：只取 OI + 价格 + 费率（不取CVD/多空比），用于每日升温快照"""
+        logger.info("开始轻量 OI 扫描（升温模式）...")
+        t_resp = self.request_with_retry("https://fapi.binance.com/fapi/v1/ticker/24hr")
+        p_resp = self.request_with_retry("https://fapi.binance.com/fapi/v1/premiumIndex")
+
+        if not t_resp or not isinstance(t_resp, list):
+            logger.error("轻量扫描失败：ticker API 错误")
+            return []
+
+        premiums = {p['symbol']: p for p in p_resp} if isinstance(p_resp, list) else {}
+
+        active_tickers = [
+            t for t in t_resp
+            if t['symbol'].endswith("USDT") and float(t['quoteVolume']) > threshold
+        ]
+        active_tickers.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
+
+        all_metrics = []
+        for t in active_tickers:
+            s = t['symbol']
+            data_point = {
+                "symbol": s,
+                "price": float(t['lastPrice']),
+                "price_chg": float(t['priceChangePercent']),
+                "oi_value": self.get_light_oi(s),
+                "oi_chg": 0,
+                "ls": 1.0,
+                "cvd_usdt": 0,
+                "funding": float(premiums[s]['lastFundingRate']) * 100 if s in premiums else 0,
+            }
+            all_metrics.append(data_point)
+
+        logger.info(f"轻量扫描完成，共 {len(all_metrics)} 个币")
+        return all_metrics
+
     def send_telegram(self, text):
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         requests.post(url, json={"chat_id": self.chat_id, "text": text, "parse_mode": "Markdown"})
@@ -339,20 +386,6 @@ class LSAnalyzer:
         return msg
 
 # ==================== OI 持续升温追踪 ====================
-def format_usd(val):
-    """将USDT金额格式化为 +$1.2M / -$3.4K 形式"""
-    if val == 0:
-        return "$0"
-    abs_val = abs(val)
-    if abs_val >= 1_000_000:
-        fmt = f"{abs_val/1_000_000:.2f}M"
-    elif abs_val >= 1_000:
-        fmt = f"{abs_val/1_000:.1f}K"
-    else:
-        fmt = f"{abs_val:.0f}"
-    return ("+$" if val > 0 else "-$") + fmt
-
-
 class WarmupTracker:
     """OI持续升温追踪器：按天聚合存储快照，并检测左侧慢牛候选"""
 
@@ -478,7 +511,7 @@ class WarmupTracker:
                 tag = "共振确认" if r['price_up'] else "价格未确认"
                 parts.append(f"• `{r['symbol']}` 🔥持续升温+{tag}")
                 parts.append(f"  OI连续上涨 {r['up_days']} 天 | OI {r['oi_change']:+.1f}%")
-                parts.append(f"  LS:{r['ls']:.2f} | CVD:{format_usd(r['cvd'])} | FR:{r['fr']:.3f}%")
+                parts.append(f"  费率:{r['fr']:.3f}%")
                 parts.append("")
 
         if chase:
@@ -499,20 +532,25 @@ class WarmupTracker:
 # ==================== 主入口 ====================
 def main():
     try:
+        mode = sys.argv[1] if len(sys.argv) > 1 else 'report'
         config = Config()
         fb = FirebaseManager(config.firebase_creds_json)
         monitor = OIMonitor(config.bot_token, config.chat_id)
-        warmup = WarmupTracker(fb.db)
 
-        # 1. 扫描并收集数据
-        scan_result = monitor.scan_and_collect()
+        if mode == 'warmup':
+            # 升温模式：轻扫 >$5M 池子，存快照并检测 OI 持续升温
+            all_metrics = monitor.scan_light(threshold=5_000_000)
+            warmup_msg = WarmupTracker(fb.db).oi_sustained_growth_scan(all_metrics)
+            if warmup_msg:
+                monitor.send_telegram(warmup_msg)
+                logger.info("OI 持续升温报告发送成功")
+            else:
+                logger.info("本次无 OI 持续升温候选")
+            return
 
-        # 2. OI持续升温检测（存储每日快照 + 检测 OI 持续增长候选）
-        warmup_msg = warmup.oi_sustained_growth_scan(scan_result.get('all_metrics', []))
-
-        # 3. 拼接并发送报告（升温板块在最前面）
-        full_msg = (warmup_msg.rstrip() + "\n\n" + scan_result['message']) if warmup_msg else scan_result['message']
-        monitor.send_telegram(full_msg)
+        # 报告模式：全指标扫描 >$10M 池子
+        scan_result = monitor.scan_and_collect(threshold=10_000_000)
+        monitor.send_telegram(scan_result['message'])
         logger.info("OI 报告发送成功")
 
         # 4. 保存数据到 Firebase

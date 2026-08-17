@@ -1,0 +1,29 @@
+name: OI Warmup Daily
+
+on:
+  schedule:
+    # 每天 UTC 01:00（北京时间 09:00）跑一次升温快照
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-warmup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run warmup scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
+        run: python main.py warmup
