@@ -540,6 +540,9 @@ def main():
         if mode == 'warmup':
             # 升温模式：轻扫 >$5M 池子，存快照并检测 OI 持续升温
             all_metrics = monitor.scan_light(threshold=5_000_000)
+            if not all_metrics:
+                logger.error("轻量扫描失败，跳过本次升温检测")
+                return
             warmup_msg = WarmupTracker(fb.db).oi_sustained_growth_scan(all_metrics)
             if warmup_msg:
                 monitor.send_telegram(warmup_msg)
