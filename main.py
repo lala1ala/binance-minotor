@@ -382,6 +382,10 @@ class WarmupTracker:
             for m in all_metrics
         }
 
+        # 当天 OI Top25（按持仓量降序）
+        ranked = sorted(all_metrics, key=lambda x: x.get('oi_value', 0) * x.get('price', 0), reverse=True)
+        top25_oi = [m['symbol'] for m in ranked[:25]]
+
         doc = self.doc_ref.get()
         snapshots = doc.to_dict().get('snapshots', []) if doc.exists else []
 
@@ -389,9 +393,10 @@ class WarmupTracker:
         for s in snapshots:
             if s.get('date') == date_str:
                 s['data'] = day_data
+                s['top25_oi'] = top25_oi
                 break
         else:
-            snapshots.append({"date": date_str, "data": day_data})
+            snapshots.append({"date": date_str, "data": day_data, "top25_oi": top25_oi})
 
         # 按日期排序，仅保留最近MAX_DAYS天
         snapshots.sort(key=lambda x: x.get('date', ''))
@@ -406,115 +411,96 @@ class WarmupTracker:
             return doc.to_dict().get('snapshots', [])
         return []
 
-    def detect_warmup(self, snapshots: List[Dict], accumulation_symbols: set) -> List[Dict]:
-        """检测OI持续升温候选，需≥3天数据才激活"""
-        if len(snapshots) < self.MIN_DAYS:
+    def detect_oi_top25_accumulation(self, snapshots: List[Dict]) -> List[Dict]:
+        """检测 OI 持续升温：过去5天至少3天出现在 OI Top25，且 OI 总趋势向上"""
+        snapshots = sorted(snapshots, key=lambda x: x.get('date', ''))
+        recent = snapshots[-self.MAX_DAYS:]
+        if len(recent) < self.MIN_DAYS:
             return []
 
-        snapshots = sorted(snapshots, key=lambda x: x.get('date', ''))
-        latest_data = snapshots[-1].get('data', {})
+        latest_data = recent[-1].get('data', {})
         results = []
 
         for symbol in latest_data:
-            series = []
-            for s in snapshots:
+            top25_days = 0
+            oi_series = []
+            price_series = []
+
+            for s in recent:
+                if symbol in s.get('top25_oi', []):
+                    top25_days += 1
                 d = s.get('data', {})
                 if symbol in d:
-                    series.append(d[symbol])
+                    oi_series.append(d[symbol].get('oi', 0))
+                    price_series.append(d[symbol].get('price', 0))
 
-            if len(series) < self.MIN_DAYS:
+            # 触发条件：≥3 天 Top25 + OI 末日 > 首日
+            if top25_days < self.MIN_DAYS:
                 continue
-
-            oi_values = [p.get('oi', 0) for p in series]
-            price_values = [p.get('price', 0) for p in series]
-
-            # 1) 最近≥3天 OI 在增长（当天 > 前一天）
-            up_days = sum(1 for i in range(1, len(oi_values)) if oi_values[i] > oi_values[i - 1])
-            if up_days < 3:
+            if len(oi_series) < 2:
                 continue
-
-            # 2) OI整体趋势向上（末日 > 首日，且涨幅 > 5%）
-            first_oi, last_oi = oi_values[0], oi_values[-1]
+            first_oi, last_oi = oi_series[0], oi_series[-1]
             if first_oi <= 0 or last_oi <= first_oi:
                 continue
+
             oi_change = (last_oi - first_oi) / first_oi * 100
-            if oi_change <= 5:
-                continue
 
-            # 3) 价格5天涨幅 < 15%（过滤已拉完的）
-            first_price, last_price = price_values[0], price_values[-1]
-            if first_price <= 0:
-                continue
-            price_change = (last_price - first_price) / first_price * 100
-            if price_change >= 15:
-                continue
+            # 确认加分：价格同步上涨（OI+Price 同向）
+            price_up = len(price_series) >= 2 and price_series[0] > 0 and price_series[-1] > price_series[0]
 
-            # 4) 价格距5天最低点反弹 < 10%（确认"刚开始"）
-            min_price = min(price_values)
-            if min_price <= 0:
-                continue
-            rebound = (last_price - min_price) / min_price * 100
-            if rebound >= 10:
-                continue
-
-            latest = series[-1]
-            flags = []
-            if latest.get('ls', 1.0) > 1.1:
-                flags.append('🟢')  # 大户偏多
-            if latest.get('cvd', 0) > 0:
-                flags.append('🟢')  # 买压主导
-            if latest.get('fr', 0) < 0:
-                flags.append('💎')  # 逆势信号（空头付费）
-            if symbol in accumulation_symbols:
-                flags.append('⭐')  # 双重确认
+            # 减分/排除：价格距5日低点 > 15%（追高风险）
+            chase_high = False
+            if price_series:
+                low = min(price_series)
+                if low > 0:
+                    chase_high = (price_series[-1] - low) / low * 100 > 15
 
             results.append({
                 "symbol": symbol,
-                "flags": "".join(flags),
+                "top25_days": top25_days,
+                "total_days": len(recent),
                 "oi_change": oi_change,
-                "up_days": up_days,
-                "total_days": len(series),
-                "price_change": price_change,
-                "rebound": rebound,
-                "ls": latest.get('ls', 1.0),
-                "cvd": latest.get('cvd', 0),
-                "fr": latest.get('fr', 0),
+                "price_up": price_up,
+                "chase_high": chase_high,
+                "ls": latest_data[symbol].get('ls', 1.0),
+                "cvd": latest_data[symbol].get('cvd', 0),
+                "fr": latest_data[symbol].get('fr', 0),
             })
 
         results.sort(key=lambda x: x['oi_change'], reverse=True)
         return results
 
-    def _conclusion(self, d: Dict) -> str:
-        parts = ["OI稳步攀升", "价格未启动"]
-        if d['fr'] < 0:
-            parts.append("负费率")
-        if d['ls'] > 1.1:
-            parts.append("大户偏多")
-        if d['cvd'] > 0:
-            parts.append("买压主导")
-        return f"  ⚡ {'+'.join(parts)} = 强左侧\n"
-
-    def format_message(self, results: List[Dict]) -> str:
+    def format_oi_top25_message(self, results: List[Dict]) -> str:
         if not results:
             return ""
 
-        msg = f"🔥 **【OI持续升温 (左侧慢牛候选)】**\n发现 {len(results)} 个OI缓慢攀升+价格未暴涨的标的：\n\n"
-        for d in results:
-            cvd_str = format_usd(d['cvd'])
-            msg += f"• `{d['symbol']}` {d['flags']}\n"
-            msg += f"  OI 5日变化: {d['oi_change']:+.1f}% ({d['up_days']}/{d['total_days']}天上涨)\n"
-            msg += f"  Price 5日变化: {d['price_change']:+.1f}% (距低点{d['rebound']:+.1f}%)\n"
-            msg += f"  LS: {d['ls']:.2f} | CVD: {cvd_str} | FR: {d['fr']:.3f}%\n"
-            msg += self._conclusion(d)
-            msg += "\n"
-        return msg
+        clean = [r for r in results if not r['chase_high']]
+        chase = [r for r in results if r['chase_high']]
 
-    def warmup_scan(self, all_metrics: List[Dict], accumulation_symbols: set) -> str:
-        """存储每日快照并检测持续升温，返回Telegram消息片段（无候选返回空串）"""
+        parts = []
+        if clean:
+            parts.append(f"🔥 **【OI持续升温 (Top25)】**\n发现 {len(clean)} 个候选：\n")
+            for r in clean:
+                tag = "共振确认" if r['price_up'] else "价格未确认"
+                parts.append(f"• `{r['symbol']}` 🔥持续升温+{tag}")
+                parts.append(f"  Top25上榜 {r['top25_days']}/{r['total_days']}天 | OI {r['oi_change']:+.1f}%")
+                parts.append(f"  LS:{r['ls']:.2f} | CVD:{format_usd(r['cvd'])} | FR:{r['fr']:.3f}%")
+                parts.append("")
+
+        if chase:
+            parts.append(f"⚠️ **【追高风险】** 价格已从5日低点涨>15%：\n")
+            for r in chase:
+                parts.append(f"• `{r['symbol']}` Top25 {r['top25_days']}天 | OI {r['oi_change']:+.1f}%")
+            parts.append("")
+
+        return "\n".join(parts).rstrip()
+
+    def oi_top25_scan(self, all_metrics: List[Dict]) -> str:
+        """存储每日快照（含 OI Top25）并检测持续升温，返回 Telegram 消息片段"""
         self.store_daily_snapshot(all_metrics)
         snapshots = self.get_history()
-        results = self.detect_warmup(snapshots, accumulation_symbols)
-        return self.format_message(results)
+        results = self.detect_oi_top25_accumulation(snapshots)
+        return self.format_oi_top25_message(results)
 
 # ==================== 主入口 ====================
 def main():
@@ -527,9 +513,8 @@ def main():
         # 1. 扫描并收集数据
         scan_result = monitor.scan_and_collect()
 
-        # 2. OI持续升温检测（存储每日快照 + 检测左侧慢牛候选）
-        accumulation_symbols = {sym for sym, d in scan_result['coins'].items() if d.get('section') == 'accumulation'}
-        warmup_msg = warmup.warmup_scan(scan_result.get('all_metrics', []), accumulation_symbols)
+        # 2. OI持续升温检测（存储每日快照 + 检测 OI Top25 持续升温候选）
+        warmup_msg = warmup.oi_top25_scan(scan_result.get('all_metrics', []))
 
         # 3. 拼接并发送报告（升温板块在最前面）
         full_msg = (warmup_msg.rstrip() + "\n\n" + scan_result['message']) if warmup_msg else scan_result['message']
