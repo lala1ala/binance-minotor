@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-一次性回填 OI Top25 历史快照到 Firebase。
+一次性回填每日 OI/价格历史到 Firebase。
 
-用途：新上线的「OI持续升温 (Top25)」维度需要 >=3 天 top25_oi 数据才能触发。
-本脚本把过去 5 天的 OI Top25（按美元名义价值）回填进 Firebase，
-让已经走了几天的慢牛（如 LINK）能立刻被标记，而不是再等 3 天。
+用途：direction B 的「OI持续升温（按增长）」维度需要过去几天的每日 OI/价格数据。
+本脚本把最近 5 天的 data（每币每日 oi 合约数 + 收盘价）回填进 Firebase，
+让检测能立刻有历史数据可用，而不是再等 3 天。
+
+（早期版本叫 backfill_top25，回填的是 OI Top25 排名；现已改为回填每日 data。）
 
 运行方式（在 GitHub Actions 里用 workflow_dispatch 手动触发）：
     python backfill_top25.py
@@ -76,12 +78,12 @@ def get_top_symbols():
 
 
 def build_backfill_days():
-    """返回 {beijing_date: {'data': {symbol: {...}}, 'top25_oi': [symbol, ...]}}"""
+    """返回 {beijing_date: {symbol: {'oi': contracts, 'price': close, 'ls':..., 'cvd':..., 'fr':...}}}"""
     symbols = get_top_symbols()
     if not symbols:
         raise RuntimeError("无法获取 ticker 列表（可能 IP 受限）")
 
-    # beijing_date -> {symbol: {'oi': contracts, 'price': close, 'oi_usd': usd}}
+    # beijing_date -> {symbol: {'oi': contracts, 'price': close}}
     day_map = {}
 
     for i, sym in enumerate(symbols):
@@ -102,9 +104,8 @@ def build_backfill_days():
             bj = datetime.fromtimestamp(ts / 1000, tz=timezone.utc) + timedelta(hours=8)
             bj_date = bj.strftime('%Y-%m-%d')
             oi_contracts = float(r.get('sumOpenInterest') or 0)
-            oi_usd = float(r.get('sumOpenInterestValue') or oi_contracts)
             price = float(k_by_ts[ts][4]) if ts in k_by_ts else 0.0
-            day_map.setdefault(bj_date, {})[sym] = {'oi': oi_contracts, 'price': price, 'oi_usd': oi_usd}
+            day_map.setdefault(bj_date, {})[sym] = {'oi': oi_contracts, 'price': price}
 
         if (i + 1) % 20 == 0:
             print(f"  {i + 1}/{len(symbols)} ...")
@@ -112,8 +113,6 @@ def build_backfill_days():
 
     result = {}
     for bj_date, sym_data in day_map.items():
-        ranked = sorted(sym_data.items(), key=lambda kv: kv[1]['oi_usd'], reverse=True)
-        top25_oi = [sym for sym, _ in ranked[:25]]
         data = {
             sym: {
                 'oi': v['oi'],
@@ -124,7 +123,7 @@ def build_backfill_days():
             }
             for sym, v in sym_data.items()
         }
-        result[bj_date] = {'data': data, 'top25_oi': top25_oi}
+        result[bj_date] = data
 
     return result
 
@@ -141,7 +140,7 @@ def main():
     db = firestore.client()
     doc_ref = db.collection(COLLECTION).document(DOC_ID)
 
-    print("回填历史 OI Top25 ...")
+    print("回填每日 OI/价格历史 ...")
     backfill_days = build_backfill_days()
     print(f"回填到 {len(backfill_days)} 个自然日")
 
@@ -149,14 +148,13 @@ def main():
     snapshots = doc.to_dict().get('snapshots', []) if doc.exists else []
     by_date = {s.get('date'): s for s in snapshots}
 
-    for bj_date, bf in backfill_days.items():
+    for bj_date, data in backfill_days.items():
         if bj_date in by_date:
             s = by_date[bj_date]
-            s['top25_oi'] = bf['top25_oi']  # 补/覆盖 Top25
             if not s.get('data'):
-                s['data'] = bf['data']      # 若缺 data 则补
+                s['data'] = data      # 若缺 data 则补
         else:
-            by_date[bj_date] = {'date': bj_date, 'data': bf['data'], 'top25_oi': bf['top25_oi']}
+            by_date[bj_date] = {'date': bj_date, 'data': data}
 
     snapshots = sorted(by_date.values(), key=lambda x: x.get('date', ''))
     snapshots = snapshots[-BACKFILL_DAYS:]
@@ -164,8 +162,8 @@ def main():
 
     print(f"完成。当前共 {len(snapshots)} 个快照：")
     for s in snapshots:
-        n = len(s.get('top25_oi', []))
-        print(f"  {s.get('date')}: top25_oi {n} 个")
+        n = len(s.get('data', {}))
+        print(f"  {s.get('date')}: data {n} 个币")
 
 
 if __name__ == '__main__':

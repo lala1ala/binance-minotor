@@ -1,4 +1,4 @@
-name: Backfill OI Top25
+name: Backfill OI History
 
 on:
   workflow_dispatch:
