@@ -103,7 +103,7 @@ class OIMonitor:
     # 「价格平静」口径：用户明确要求「OI 和价格同向、但涨跌不超过 5% 也可纳入信号」。
     # 所以不是"价格不涨"才算好，而是 |涨跌| <= 5% 且 OI 在累积就值得看。
     FLAT_PRICE_PCT = 5.0
-    OI_GROWTH_MIN = 1.0        # OI 涨幅门槛（%），低于此不算"在累积"
+    OI_GROWTH_MIN = 1.0        # OI 累积门槛（%）。对「低位区」用的是 24h 变化（oi_chg_1d）
 
     def __init__(self, bot_token, chat_id):
         self.bot_token = bot_token
@@ -210,23 +210,47 @@ class OIMonitor:
         return None
 
     def get_real_oi_growth(self, symbol: str):
+        """返回 (当前OI, 2h变化%, 24h变化%, LS)。
+
+        为什么同时要两个窗口（2026-09-13 用 41 天真实数据回测得出）:
+
+            信号组                        前瞻7d超额中位   胜率
+            全体基线                        +0.88%        54%
+            OI 2h 涨>1% 且 |24h价|<=5%      +1.05%        57%
+            OI 24h 涨>1% 且 |24h价|<=5%     +2.02%        57%   ← 采用
+            OI 2h 涨>2%（不限价格）          +0.48%        52%   ← 低于基线，是噪音
+            OI 24h 涨>2%（不限价格）         +1.55%        56%
+
+        更关键的对照 —— 「OI 涨」与「价格平静」是**交集**才有效:
+            只价格平静(OI不涨)  +0.78% / 53%     只 OI 涨(价格不平静)  +0.91% / 55%
+            两个都满足(24h)     +2.02% / 57%
+
+        结论: 2h 窗口的 OI 脉冲单独看是**负 alpha**，日级窗口才是「累积」。
+        但 2h 仍保留 —— 「2h OI 爆增榜」要的就是脉冲，两类信号各有用途。
+        样本 n≈200~285、每币 168h 冷却去重叠，证据强度: 中等（非决定性）。
+        """
         try:
             # 获取当前OI
             oi_resp = self.request_with_retry(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}")
             if not oi_resp or 'openInterest' not in oi_resp:
-                return 0, 0, 1.0
+                return 0, 0, 0, 1.0
             oi_now = float(oi_resp['openInterest'])
-            
-            # 获取历史OI（过去2小时）
-            hist_url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=2h&limit=2"
-            hist_resp = self.request_with_retry(hist_url)
-            
-            # 注意：空列表也要挡住，否则下面的 hist_resp[0] 会抛 IndexError
-            if not isinstance(hist_resp, list) or not hist_resp:
-                return oi_now, 0, 1.0
 
-            oi_2h_ago = float(hist_resp[0]['sumOpenInterest'])
-            oi_growth = ((oi_now - oi_2h_ago) / oi_2h_ago) * 100 if oi_2h_ago > 0 else 0
+            # 一次请求拿 25 个点的小时级 OI，同时算 2h 与 24h 变化
+            # （原来是 period=2h&limit=2 只拿 2h；换成 1h/25 后请求数不变，多出 24h 维度）
+            hist_url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=1h&limit=25"
+            hist_resp = self.request_with_retry(hist_url)
+
+            oi_chg_2h = 0.0
+            oi_chg_1d = 0.0
+            # 注意：空列表也要挡住，否则下面的索引会抛 IndexError
+            if isinstance(hist_resp, list) and len(hist_resp) >= 3:
+                oi_2h_ago = float(hist_resp[-3]['sumOpenInterest'])
+                if oi_2h_ago > 0:
+                    oi_chg_2h = (oi_now - oi_2h_ago) / oi_2h_ago * 100
+                oi_24h_ago = float(hist_resp[0]['sumOpenInterest'])
+                if oi_24h_ago > 0:
+                    oi_chg_1d = (oi_now - oi_24h_ago) / oi_24h_ago * 100
 
             # LS Ratio（过去2小时）
             ls_url = f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={symbol}&period=2h&limit=1"
@@ -235,10 +259,10 @@ class OIMonitor:
             if isinstance(ls_resp, list) and ls_resp:
                 ls_ratio = float(ls_resp[0]['longShortRatio'])
 
-            return oi_now, oi_growth, ls_ratio
+            return oi_now, oi_chg_2h, oi_chg_1d, ls_ratio
         except Exception as e:
             logger.error(f"Error fetching {symbol}: {e}")
-            return 0, 0, 1.0
+            return 0, 0, 0, 1.0
 
     def get_cvd_2h_usdt(self, symbol: str):
         """计算过去2小时的主动买卖净差值 (CVD)，以 USDT 计价"""
@@ -411,7 +435,7 @@ class OIMonitor:
         """采集单个交易对的全部指标（供并发调用）。失败返回 None。"""
         s = ticker['symbol']
         try:
-            oi_val, oi_chg, ls = self.get_real_oi_growth(s)
+            oi_val, oi_chg, oi_chg_1d, ls = self.get_real_oi_growth(s)
             cvd_usdt = self.get_cvd_2h_usdt(s)
             funding = float(premium['lastFundingRate']) * 100 if premium else 0
             return {
@@ -419,7 +443,8 @@ class OIMonitor:
                 "price": float(ticker['lastPrice']),
                 "price_chg": float(ticker['priceChangePercent']),
                 "oi_value": oi_val,
-                "oi_chg": oi_chg,
+                "oi_chg": oi_chg,          # 2h 变化：给「2h OI 爆增榜」用
+                "oi_chg_1d": oi_chg_1d,    # 24h 变化：给「低位区」闸门用（回测显示日级才有效）
                 "ls": ls,
                 "cvd_usdt": cvd_usdt,
                 "funding": funding,
@@ -438,6 +463,7 @@ class OIMonitor:
                 "price_chg": float(ticker['priceChangePercent']),
                 "oi_value": self.get_light_oi(s),
                 "oi_chg": 0,
+                "oi_chg_1d": 0,
                 "ls": 1.0,
                 "cvd_usdt": 0,
                 "funding": float(premium['lastFundingRate']) * 100 if premium else 0,
@@ -534,16 +560,17 @@ class OIMonitor:
         all_metrics = [collected[t['symbol']] for t in active_tickers if t['symbol'] in collected]
 
         # 筛选逻辑
-        # 低位埋伏: 价格未暴涨(-2%到5%), OI增加, 大户多, 且CVD纯买入>0
-        accumulation = [d for d in all_metrics if -2 < d['price_chg'] < 5 and d['oi_chg'] > 1.5 and d['ls'] > 1.2 and d['cvd_usdt'] > 0]
+        # 低位埋伏: 价格未暴涨(-2%到5%), OI增加(24h窗口), 大户多, 且CVD纯买入>0
+        # OI 判定已从 2h 改为 24h：回测显示 2h 脉冲单独看是负 alpha（详见 get_real_oi_growth）
+        accumulation = [d for d in all_metrics if -2 < d['price_chg'] < 5 and d['oi_chg_1d'] > 1.5 and d['ls'] > 1.2 and d['cvd_usdt'] > 0]
         top_oi = sorted(all_metrics, key=lambda x: x['oi_chg'], reverse=True)[:5]
         ext_neg = sorted([d for d in all_metrics if d['funding'] < 0], key=lambda x: x['funding'])[:3]
         ext_pos = sorted([d for d in all_metrics if d['funding'] > 0], key=lambda x: x['funding'], reverse=True)[:3]
 
         # ---- 两个位置：只给候选币补算，避免 ~300 次额外请求 ----
-        # 候选池 = 低位埋伏 + OI爆增 + 「OI 温和累积且价格平静」的形状
+        # 候选池 = 低位埋伏 + OI爆增 + 「OI 24h 累积且价格平静」的形状
         quiet = [d for d in all_metrics
-                 if d['oi_chg'] > self.OI_GROWTH_MIN
+                 if d['oi_chg_1d'] > self.OI_GROWTH_MIN
                  and abs(d['price_chg']) <= self.FLAT_PRICE_PCT]
         quiet.sort(key=lambda x: x['oi_chg'], reverse=True)
         candidate_syms = ([d['symbol'] for d in accumulation]
@@ -590,10 +617,10 @@ class OIMonitor:
         low_zone = [
             d for d in all_metrics
             if d.get('is_oi_low')
-            and d['oi_chg'] > self.OI_GROWTH_MIN
+            and d['oi_chg_1d'] > self.OI_GROWTH_MIN
             and abs(d['price_chg']) <= self.FLAT_PRICE_PCT
         ]
-        low_zone.sort(key=lambda x: x['oi_chg'], reverse=True)
+        low_zone.sort(key=lambda x: x['oi_chg_1d'], reverse=True)
         low_zone_syms = {d['symbol'] for d in low_zone}
 
         # 反向提示：OI 已在高位的币，别当低位机会
@@ -621,23 +648,25 @@ class OIMonitor:
         msg += "\n"
 
         # ① 最符合口味的一栏放在最前面：杠杆低位 + OI 累积 + 价格平静
-        msg += f"\n🟢 **低位区·OI静默累积 (杠杆位≤25% + OI增 + |涨跌|≤5%)**\n"
+        # 标题里的窗口必须写准（原为含糊的「OI静默累积」，实际用的是 2h 变化 ── 已修）
+        msg += f"\n🟢 **低位区·OI日级累积 (杠杆位≤25% + OI 24h增>{self.OI_GROWTH_MIN:.0f}% + |24h涨跌|≤{self.FLAT_PRICE_PCT:.0f}%)**\n"
         if not low_zone:
             msg += "• 暂无匹配\n"
         for d in low_zone[:8]:
             dd = f" | DD{d['year_dd']:+.0f}%" if d.get('year_dd') is not None else ""
             msg += (f"• `{d['symbol']}`: {pos_tag(d)}{dd} "
-                    f"| OI:+{d['oi_chg']:.1f}% | 价:{d['price_chg']:+.1f}%\n")
+                    f"| OI:24h {d['oi_chg_1d']:+.1f}% (2h {d['oi_chg']:+.1f}%) "
+                    f"| 价:{d['price_chg']:+.1f}%\n")
             structured_coins[d['symbol']] = {"ls_value": d['ls'], "section": "low_zone", "extra_info": ""}
 
-        msg += "\n💎 **低位埋伏 (横盘+OI增+大户多+CVD净买入)**\n"
+        msg += "\n💎 **低位埋伏 (横盘+OI 24h增+大户多+CVD净买入)**\n"
         if not accumulation: msg += "• 暂无匹配\n"
         for d in accumulation:
             cvd_str = format_usd(d['cvd_usdt'])
-            msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:+{d['oi_chg']:.1f}% | LS:{d['ls']:.2f} | CVD:{cvd_str}\n"
+            msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:24h {d['oi_chg_1d']:+.1f}% | LS:{d['ls']:.2f} | CVD:{cvd_str}\n"
             structured_coins.setdefault(d['symbol'], {"ls_value": d['ls'], "section": "accumulation", "extra_info": ""})
 
-        msg += "\n📈 **2h OI 爆增榜**\n"
+        msg += "\n📈 **2h OI 爆增榜**（脉冲，不是累积；回测显示单独看是负 alpha）\n"
         for d in top_oi:
             cvd_str = format_usd(d['cvd_usdt'])
             msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:+{d['oi_chg']:.1f}% | CVD:{cvd_str} | LS:{d['ls']:.2f}\n"
