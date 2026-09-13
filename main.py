@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
-from dataclasses import dataclass, asdict
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,17 +28,6 @@ class Config:
         if not all([self.bot_token, self.chat_id, self.firebase_creds_json]):
             raise ValueError("缺少必要的环境变量: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, FIREBASE_CREDENTIALS")
 
-        self.report_cycle = 4  # 4次报告(约2小时)为一个周期
-        self.collection_name = "binance_monitor"
-
-# ==================== 数据结构 ====================
-@dataclass
-class CoinData:
-    symbol: str
-    ls_value: float
-    section: str
-    extra_info: str = ""
-
 # ==================== Firebase 管理 ====================
 class FirebaseManager:
     def __init__(self, creds_json):
@@ -48,30 +36,6 @@ class FirebaseManager:
             cred = credentials.Certificate(cred_dict)
             firebase_admin.initialize_app(cred)
         self.db = firestore.client()
-        self.collection = self.db.collection('binance_monitor')
-
-    def get_current_cycle(self) -> List[Dict]:
-        """获取当前周期的报告列表"""
-        doc = self.collection.document('state').get()
-        if doc.exists:
-            data = doc.to_dict()
-            return data.get('current_cycle', [])
-        return []
-
-    def add_report_to_cycle(self, report: Dict):
-        """添加报告到当前周期"""
-        doc_ref = self.collection.document('state')
-        # 使用 array_union 添加原子性 (或者直接读-改-写，这里读-改-写更可控)
-        current = self.get_current_cycle()
-        current.append(report)
-        doc_ref.set({'current_cycle': current}, merge=True)
-        return len(current)
-
-    def reset_cycle(self):
-        """重置周期"""
-        doc_ref = self.collection.document('state')
-        doc_ref.set({'current_cycle': []}, merge=True)
-        # 可选：归档历史数据
 
 # ==================== OI 监控核心逻辑 ====================
 class OIMonitor:
@@ -264,29 +228,6 @@ class OIMonitor:
             logger.error(f"Error fetching {symbol}: {e}")
             return 0, 0, 0, 1.0
 
-    def get_cvd_2h_usdt(self, symbol: str):
-        """计算过去2小时的主动买卖净差值 (CVD)，以 USDT 计价"""
-        try:
-            # 获取过去2小时的 5m K线 (limit=24)
-            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=24"
-            resp = self.request_with_retry(url)
-            if not resp or not isinstance(resp, list):
-                return 0.0
-            
-            net_delta_usdt = 0.0
-            for k in resp:
-                quote_vol = float(k[7]) # 总USDT交易量
-                taker_buy_usdt = float(k[10]) # 主动买入的USDT量
-                taker_sell_usdt = quote_vol - taker_buy_usdt # 主动卖出的USDT量
-                delta = taker_buy_usdt - taker_sell_usdt
-                
-                net_delta_usdt += delta
-                
-            return net_delta_usdt
-        except Exception as e:
-            logger.error(f"Error fetching CVD for {symbol}: {e}")
-            return 0.0
-
     def get_light_oi(self, symbol: str) -> float:
         """轻量获取当前 OI（合约张数）"""
         try:
@@ -412,7 +353,7 @@ class OIMonitor:
             logger.error(f"LS 获取失败 {symbol}: {e}")
         return None
 
-    def enrich_positions(self, symbols: List[str]) -> Dict[str, Dict]:
+    def enrich_positions(self, symbols: List[str], deadline: Optional[float] = None) -> Dict[str, Dict]:
         """只为候选币补算「两个位置」：价格一年分位 + OI 存量分位。
 
         不给全部 ~150 个币算：每个币要多 2 次请求（365 根日线 + 30 天 OI），
@@ -428,7 +369,7 @@ class OIMonitor:
             s = t["symbol"]
             return {"symbol": s, "yp": self.get_year_position(s), "oip": self.get_oi_position(s)}
 
-        out = self._run_concurrent([{"symbol": s} for s in symbols], _one)
+        out = self._run_concurrent([{"symbol": s} for s in symbols], _one, deadline=deadline)
         return {s: {"yp": d.get("yp"), "oip": d.get("oip")} for s, d in out.items()}
 
     def _collect_one(self, ticker: Dict, premium: Optional[Dict]) -> Optional[Dict]:
@@ -436,7 +377,6 @@ class OIMonitor:
         s = ticker['symbol']
         try:
             oi_val, oi_chg, oi_chg_1d, ls = self.get_real_oi_growth(s)
-            cvd_usdt = self.get_cvd_2h_usdt(s)
             funding = float(premium['lastFundingRate']) * 100 if premium else 0
             return {
                 "symbol": s,
@@ -446,7 +386,6 @@ class OIMonitor:
                 "oi_chg": oi_chg,          # 2h 变化：给「2h OI 爆增榜」用
                 "oi_chg_1d": oi_chg_1d,    # 24h 变化：给「低位区」闸门用（回测显示日级才有效）
                 "ls": ls,
-                "cvd_usdt": cvd_usdt,
                 "funding": funding,
             }
         except Exception as e:
@@ -465,26 +404,27 @@ class OIMonitor:
                 "oi_chg": 0,
                 "oi_chg_1d": 0,
                 "ls": 1.0,
-                "cvd_usdt": 0,
                 "funding": float(premium['lastFundingRate']) * 100 if premium else 0,
             }
         except Exception as e:
             logger.error(f"轻量采集 {s} 失败: {e}")
             return None
 
-    def _run_concurrent(self, tickers: List[Dict], worker) -> Dict[str, Dict]:
+    def _run_concurrent(self, tickers: List[Dict], worker, deadline: Optional[float] = None) -> Dict[str, Dict]:
         """并发执行 worker(ticker)，返回 {symbol: data_point}。
 
         - 并发度 MAX_WORKERS，远低于币安 fapi 的权重上限（2400/分钟），不会触发限流
-        - 总耗时受 SCAN_BUDGET_SECONDS 约束：到点即停止等待，用已拿到的数据出报告，
+        - 总耗时受 deadline 约束：到点即停止等待，用已拿到的数据出报告，
           而不是像原来那样把 600 次串行请求一路拖到 4~5 小时
+        - deadline 可传入共享的绝对时间，让「扫描 + 候选补位」共用同一个总预算，
+          避免两段各自 600s 叠加撞上 workflow 的 20 分钟硬上限
         """
         results: Dict[str, Dict] = {}
         total = len(tickers)
         if not total:
             return results
 
-        deadline = time.monotonic() + self.SCAN_BUDGET_SECONDS
+        deadline = deadline if deadline is not None else (time.monotonic() + self.SCAN_BUDGET_SECONDS)
         started = time.monotonic()
         logger.info(f"并发采集 {total} 个交易对（并发度 {self.MAX_WORKERS}，预算 {self.SCAN_BUDGET_SECONDS}s）...")
 
@@ -548,21 +488,23 @@ class OIMonitor:
         ]
         active_tickers.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
 
-        structured_coins = {} # 用于存入数据库
         total = len(active_tickers)
 
         # 并发取数（原来是完全串行的 for 循环：约 600 次请求，最坏每次 55s，合计 4~5 小时）
+        # 整个「扫描 + 候选补位」共用一个总预算，避免两段 600s 叠加撞 20 分钟 timeout
+        overall_deadline = time.monotonic() + self.SCAN_BUDGET_SECONDS
         collected = self._run_concurrent(
             active_tickers,
             lambda t: self._collect_one(t, premiums.get(t['symbol'])),
+            deadline=overall_deadline,
         )
         # 按 24h 成交额降序还原顺序，保证报告内容与原实现一致、可复现
         all_metrics = [collected[t['symbol']] for t in active_tickers if t['symbol'] in collected]
 
         # 筛选逻辑
-        # 低位埋伏: 价格未暴涨(-2%到5%), OI增加(24h窗口), 大户多, 且CVD纯买入>0
+        # 低位埋伏: 价格未暴涨(-2%到5%), OI增加(24h窗口), 大户多
         # OI 判定已从 2h 改为 24h：回测显示 2h 脉冲单独看是负 alpha（详见 get_real_oi_growth）
-        accumulation = [d for d in all_metrics if -2 < d['price_chg'] < 5 and d['oi_chg_1d'] > 1.5 and d['ls'] > 1.2 and d['cvd_usdt'] > 0]
+        accumulation = [d for d in all_metrics if -2 < d['price_chg'] < 5 and d['oi_chg_1d'] > 1.5 and d['ls'] > 1.2]
         top_oi = sorted(all_metrics, key=lambda x: x['oi_chg'], reverse=True)[:5]
         ext_neg = sorted([d for d in all_metrics if d['funding'] < 0], key=lambda x: x['funding'])[:3]
         ext_pos = sorted([d for d in all_metrics if d['funding'] > 0], key=lambda x: x['funding'], reverse=True)[:3]
@@ -576,7 +518,11 @@ class OIMonitor:
         candidate_syms = ([d['symbol'] for d in accumulation]
                           + [d['symbol'] for d in top_oi]
                           + [d['symbol'] for d in quiet[:30]])
-        pos_map = self.enrich_positions(candidate_syms)
+        # 补位共享同一个总预算：剩余时间不足就跳过补位，报告照发（标签显示「?」）
+        if overall_deadline - time.monotonic() > 30:
+            pos_map = self.enrich_positions(candidate_syms, deadline=overall_deadline)
+        else:
+            pos_map = {}
         for d in all_metrics:
             pm = pos_map.get(d['symbol']) or {}
             yp, oip = pm.get('yp'), pm.get('oip')
@@ -627,17 +573,6 @@ class OIMonitor:
         high_leverage = [d for d in all_metrics
                          if d.get('oi_pos') is not None and d['oi_pos'] >= 0.90]
 
-        # 金额格式化小工具
-        def format_usd(val):
-            abs_val = abs(val)
-            if abs_val >= 1_000_000:
-                fmt = f"{abs_val/1_000_000:.2f}M"
-            elif abs_val >= 1_000:
-                fmt = f"{abs_val/1_000:.1f}K"
-            else:
-                fmt = f"{abs_val:.0f}"
-            return "+$" + fmt if val > 0 else "-$" + fmt
-
         # 构造报告文本
         beijing_time = datetime.utcnow() + timedelta(hours=8)
         msg = f"🛰️ **【{beijing_time.strftime('%H:%M')} 真实持仓扫描 (GHA版)】**\n"
@@ -657,22 +592,15 @@ class OIMonitor:
             msg += (f"• `{d['symbol']}`: {pos_tag(d)}{dd} "
                     f"| OI:24h {d['oi_chg_1d']:+.1f}% (2h {d['oi_chg']:+.1f}%) "
                     f"| 价:{d['price_chg']:+.1f}%\n")
-            structured_coins[d['symbol']] = {"ls_value": d['ls'], "section": "low_zone", "extra_info": ""}
 
-        msg += "\n💎 **低位埋伏 (横盘+OI 24h增+大户多+CVD净买入)**\n"
+        msg += "\n💎 **低位埋伏 (横盘+OI 24h增+大户多)**\n"
         if not accumulation: msg += "• 暂无匹配\n"
         for d in accumulation:
-            cvd_str = format_usd(d['cvd_usdt'])
-            msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:24h {d['oi_chg_1d']:+.1f}% | LS:{d['ls']:.2f} | CVD:{cvd_str}\n"
-            structured_coins.setdefault(d['symbol'], {"ls_value": d['ls'], "section": "accumulation", "extra_info": ""})
+            msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:24h {d['oi_chg_1d']:+.1f}% | LS:{d['ls']:.2f}\n"
 
         msg += "\n📈 **2h OI 爆增榜**（脉冲，不是累积；回测显示单独看是负 alpha）\n"
         for d in top_oi:
-            cvd_str = format_usd(d['cvd_usdt'])
-            msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:+{d['oi_chg']:.1f}% | CVD:{cvd_str} | LS:{d['ls']:.2f}\n"
-            # 如果币种重复，优先保留前面的分类，否则覆盖
-            if d['symbol'] not in structured_coins:
-                structured_coins[d['symbol']] = {"ls_value": d['ls'], "section": "top_oi", "extra_info": f"F:{d['funding']:.3f}%"}
+            msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:+{d['oi_chg']:.1f}% | LS:{d['ls']:.2f}\n"
 
         msg += "\n☢️ **极端费率**\n"
         for d in ext_neg:
@@ -695,7 +623,6 @@ class OIMonitor:
 
         return {
             "message": msg,
-            "coins": structured_coins,
             "all_metrics": all_metrics,
             "low_zone": [d['symbol'] for d in low_zone],
             "timestamp": datetime.now().isoformat()
@@ -759,53 +686,6 @@ class OIMonitor:
             except Exception as e:
                 logger.error(f"Telegram 发送异常: {e}")
 
-# ==================== LS 分析逻辑 ====================
-class LSAnalyzer:
-    @staticmethod
-    def analyze(reports: List[Dict]) -> List[Dict]:
-        """分析报告列表中的LS变化"""
-        # 整理每个币种的历史
-        coin_history = {}
-        for r in reports:
-            # 兼容旧数据结构，确保coins存在
-            coins = r.get('coins', {})
-            for symbol, data in coins.items():
-                if symbol not in coin_history:
-                    coin_history[symbol] = []
-                coin_history[symbol].append(data['ls_value'])
-
-        results = []
-        for symbol, history in coin_history.items():
-            if len(history) < 2: continue
-            
-            first = history[0]
-            last = history[-1]
-            
-            # 简单的增长判定
-            if last > first:
-                results.append({
-                    "symbol": symbol,
-                    "first": first,
-                    "last": last,
-                    "growth_pct": (last - first)/first * 100,
-                    "count": len(history)
-                })
-        
-        results.sort(key=lambda x: x['growth_pct'], reverse=True)
-        return results
-
-    @staticmethod
-    def generate_report(results: List[Dict]) -> str:
-        if not results:
-            return "🤖 **【LS趋势分析】**\n本周期未发现LS持续增长的币种。"
-            
-        msg = f"🤖 **【LS趋势分析 (最近4轮)】**\n发现 {len(results)} 个LS增长币种:\n\n"
-        for i, r in enumerate(results[:15], 1): # 只显示前15个
-            msg += f"**{i}. {r['symbol']}**\n"
-            msg += f"   • LS: {r['first']:.2f} → {r['last']:.2f} (+{r['growth_pct']:.1f}%)\n"
-            msg += f"   • 出现次数: {r['count']}\n"
-        return msg
-
 # ==================== OI 持续升温追踪 ====================
 class WarmupTracker:
     """追踪「OI 缓慢累积」并分类，输出符合「买得便宜」口味的候选。
@@ -851,8 +731,6 @@ class WarmupTracker:
             m['symbol']: {
                 "oi": m.get('oi_value', 0),
                 "price": m.get('price', 0),
-                "ls": m.get('ls', 1.0),
-                "cvd": m.get('cvd_usdt', 0),
                 "fr": m.get('funding', 0),
             }
             for m in all_metrics
@@ -1082,10 +960,11 @@ def main():
     try:
         mode = sys.argv[1] if len(sys.argv) > 1 else 'report'
         config = Config()
-        fb = FirebaseManager(config.firebase_creds_json)
         monitor = OIMonitor(config.bot_token, config.chat_id)
 
         if mode == 'warmup':
+            # warmup 需要 Firebase 存快照；report 模式完全不碰 Firebase
+            fb = FirebaseManager(config.firebase_creds_json)
             # 升温模式：轻扫 >$5M 池子，存快照并检测「OI 缓慢累积」
             # 检测后会只给候选币补算 LS 与一年低点分位（~40 次请求，不给全部 150 个）
             all_metrics = monitor.scan_light(threshold=5_000_000)
@@ -1105,29 +984,6 @@ def main():
         monitor.send_telegram(scan_result['message'])
         logger.info("OI 报告发送成功")
 
-        # 4. 保存数据到 Firebase
-        report_record = {
-            "timestamp": scan_result['timestamp'],
-            "coins": scan_result['coins']
-        }
-        cycle_len = fb.add_report_to_cycle(report_record)
-        logger.info(f"数据已保存，当前周期进度: {cycle_len}/{config.report_cycle}")
-
-        # 5. 检查是否需要分析
-        if cycle_len >= config.report_cycle:
-            logger.info("达到周期，开始LS分析...")
-            previous_reports = fb.get_current_cycle()
-            
-            # 分析
-            analysis_results = LSAnalyzer.analyze(previous_reports)
-            analysis_msg = LSAnalyzer.generate_report(analysis_results)
-            
-            # 发送分析报告
-            monitor.send_telegram(analysis_msg)
-            
-            # 重置周期
-            fb.reset_cycle()
-            logger.info("周期已重置")
 
     except Exception as e:
         logger.error(f"执行出错: {e}", exc_info=True)
