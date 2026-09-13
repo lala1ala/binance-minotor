@@ -84,6 +84,19 @@ class OIMonitor:
     SCAN_BUDGET_SECONDS = 600  # 单次扫描总时间预算（10 分钟），到点就用已有数据出报告
     TELEGRAM_MAX_LEN = 4000    # Telegram 单条消息上限，超出自动分片
 
+    # ---- 低位闸门参数（来自「买得便宜」的核心口径）----
+    # 一年低点分位 pos = (现价 − 365日最低) / (365日最高 − 365日最低)
+    #   pos → 0 = 贴近一年最低（便宜）；pos → 1 = 贴近一年最高（贵）
+    YEAR_LOW_POS_MAX = 0.25    # pos <= 0.25 视为「低位区」
+    YEAR_DD_MIN = -60.0        # 距一年高点回撤 <= -60% 作为二次确认（更严格才同时要求）
+    YEAR_LOOKBACK_DAYS = 365   # 回看天数
+    YEAR_MIN_BARS = 60         # 少于 60 根日线就不下结论（次新币不参与判定）
+
+    # 「价格平静」口径：用户明确要求「OI 和价格同向、但涨跌不超过 5% 也可纳入信号」。
+    # 所以不是"价格不涨"才算好，而是 |涨跌| <= 5% 且 OI 在累积就值得看。
+    FLAT_PRICE_PCT = 5.0
+    OI_GROWTH_MIN = 1.0        # OI 涨幅门槛（%），低于此不算"在累积"
+
     def __init__(self, bot_token, chat_id):
         self.bot_token = bot_token
         self.chat_id = chat_id
@@ -252,6 +265,73 @@ class OIMonitor:
             logger.error(f"Error fetching light OI {symbol}: {e}")
         return 0.0
 
+    def get_year_position(self, symbol: str) -> Optional[Dict]:
+        """一年低点分位：判断这个币现在贵不贵。
+
+        之前整套系统只看 OI 增幅和 2h 涨跌，**完全不知道标的处在一年里的什么位置**，
+        所以经常把「已经涨过一大截」的币当成机会推出去。这个方法补上这一维。
+
+        返回:
+            pos      0~1，越小越便宜
+            dd       距一年高点的回撤%（负数）
+            low365 / high365 / days / is_cheap
+        """
+        try:
+            url = (f"https://fapi.binance.com/fapi/v1/klines"
+                   f"?symbol={symbol}&interval=1d&limit={self.YEAR_LOOKBACK_DAYS}")
+            resp = self.request_with_retry(url)
+            if not isinstance(resp, list) or len(resp) < self.YEAR_MIN_BARS:
+                return None
+            highs = [float(k[2]) for k in resp]
+            lows = [float(k[3]) for k in resp]
+            close = float(resp[-1][4])
+            hi, lo = max(highs), min(lows)
+            if hi <= lo or close <= 0:
+                return None
+            pos = (close - lo) / (hi - lo)
+            return {
+                "pos": pos,
+                "dd": (close - hi) / hi * 100,
+                "low365": lo,
+                "high365": hi,
+                "days": len(resp),
+                "is_cheap": pos <= self.YEAR_LOW_POS_MAX,
+            }
+        except Exception as e:
+            logger.error(f"一年低点分位计算失败 {symbol}: {e}")
+            return None
+
+    def get_ls_ratio(self, symbol: str) -> Optional[float]:
+        """大户多空持仓比（topLongShortPositionRatio, 2h）。
+
+        用于区分「OI 涨 + 价格跌」到底是**多头在逢跌吸筹**还是**空头在加仓**——
+        只看 OI 与价格两个量是分不开的，这是判读里最容易搞错的一处。
+        """
+        try:
+            url = (f"https://fapi.binance.com/futures/data/topLongShortPositionRatio"
+                   f"?symbol={symbol}&period=2h&limit=1")
+            resp = self.request_with_retry(url)
+            if isinstance(resp, list) and resp:
+                return float(resp[0]['longShortRatio'])
+        except Exception as e:
+            logger.error(f"LS 获取失败 {symbol}: {e}")
+        return None
+
+    def enrich_year_position(self, symbols: List[str]) -> Dict[str, Dict]:
+        """只为候选币补算一年低点分位。
+
+        不给全部 ~150 个币算：每个币要多 1 次请求（365 根日线，payload 不小）。
+        只对已经进入候选池的币算，请求量从 ~150 降到 ~20。
+        """
+        symbols = [s for s in dict.fromkeys(symbols) if s]  # 去重保序
+        if not symbols:
+            return {}
+        out = self._run_concurrent(
+            [{"symbol": s} for s in symbols],
+            lambda t: {"symbol": t["symbol"], "yp": self.get_year_position(t["symbol"])},
+        )
+        return {s: d["yp"] for s, d in out.items() if d.get("yp")}
+
     def _collect_one(self, ticker: Dict, premium: Optional[Dict]) -> Optional[Dict]:
         """采集单个交易对的全部指标（供并发调用）。失败返回 None。"""
         s = ticker['symbol']
@@ -385,6 +465,33 @@ class OIMonitor:
         ext_neg = sorted([d for d in all_metrics if d['funding'] < 0], key=lambda x: x['funding'])[:3]
         ext_pos = sorted([d for d in all_metrics if d['funding'] > 0], key=lambda x: x['funding'], reverse=True)[:3]
 
+        # ---- 一年低点分位：只给候选币补算，避免 150 次额外请求 ----
+        candidate_syms = [d['symbol'] for d in accumulation] + [d['symbol'] for d in top_oi]
+        yp_map = self.enrich_year_position(candidate_syms)
+        for d in all_metrics:
+            yp = yp_map.get(d['symbol'])
+            d['year_pos'] = yp['pos'] if yp else None
+            d['year_dd'] = yp['dd'] if yp else None
+            d['is_cheap'] = bool(yp and yp['is_cheap'])
+
+        def pos_tag(d):
+            """位置标签：位:12%🟢低位 / 位:63% / 位:?"""
+            if d.get('year_pos') is None:
+                return "位:?"
+            tag = f"位:{d['year_pos'] * 100:.0f}%"
+            return tag + ("🟢低位" if d['is_cheap'] else "")
+
+        # 用户核心口径：位置便宜 + OI 在累积 + 价格没怎么动
+        # （|涨跌| <= 5%，含小幅上涨；这才是"悄悄建仓"的形状）
+        low_zone = [
+            d for d in all_metrics
+            if d.get('is_cheap')
+            and d['oi_chg'] > self.OI_GROWTH_MIN
+            and abs(d['price_chg']) <= self.FLAT_PRICE_PCT
+        ]
+        low_zone.sort(key=lambda x: x['oi_chg'], reverse=True)
+        low_zone_syms = {d['symbol'] for d in low_zone}
+
         # 金额格式化小工具
         def format_usd(val):
             abs_val = abs(val)
@@ -403,20 +510,29 @@ class OIMonitor:
         msg += f"📊 数据完整度: {len(all_metrics)}/{total}"
         if total and len(all_metrics) < total * 0.9:
             msg += " ⚠️ 部分交易对取数失败，榜单可能不完整"
-        msg += "\n\n"
-        
-        msg += "💎 **低位埋伏 (横盘+OI增+大户多+CVD净买入)**\n"
+        msg += "\n"
+
+        # ① 最符合口味的一栏放在最前面：便宜 + OI 累积 + 价格平静
+        msg += f"\n🟢 **低位区·OI静默累积 (一年分位≤25% + OI增 + |涨跌|≤5%)**\n"
+        if not low_zone:
+            msg += "• 暂无匹配\n"
+        for d in low_zone[:8]:
+            msg += (f"• `{d['symbol']}`: {pos_tag(d)} | DD{d['year_dd']:+.0f}% "
+                    f"| OI:+{d['oi_chg']:.1f}% | 价:{d['price_chg']:+.1f}%\n")
+            structured_coins[d['symbol']] = {"ls_value": d['ls'], "section": "low_zone", "extra_info": ""}
+
+        msg += "\n💎 **低位埋伏 (横盘+OI增+大户多+CVD净买入)**\n"
         if not accumulation: msg += "• 暂无匹配\n"
         for d in accumulation:
             cvd_str = format_usd(d['cvd_usdt'])
-            msg += f"• `{d['symbol']}`: OI:+{d['oi_chg']:.1f}% | LS:{d['ls']:.2f} | CVD:{cvd_str}\n"
-            structured_coins[d['symbol']] = {"ls_value": d['ls'], "section": "accumulation", "extra_info": ""}
+            msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:+{d['oi_chg']:.1f}% | LS:{d['ls']:.2f} | CVD:{cvd_str}\n"
+            structured_coins.setdefault(d['symbol'], {"ls_value": d['ls'], "section": "accumulation", "extra_info": ""})
 
         msg += "\n📈 **2h OI 爆增榜**\n"
         for d in top_oi:
             cvd_str = format_usd(d['cvd_usdt'])
-            msg += f"• `{d['symbol']}`: OI:+{d['oi_chg']:.1f}% | CVD:{cvd_str} | LS:{d['ls']:.2f}\n"
-            # 如果币种重复，优先保留accumulation的分类，否则覆盖
+            msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:+{d['oi_chg']:.1f}% | CVD:{cvd_str} | LS:{d['ls']:.2f}\n"
+            # 如果币种重复，优先保留前面的分类，否则覆盖
             if d['symbol'] not in structured_coins:
                 structured_coins[d['symbol']] = {"ls_value": d['ls'], "section": "top_oi", "extra_info": f"F:{d['funding']:.3f}%"}
 
@@ -426,10 +542,19 @@ class OIMonitor:
         for d in ext_pos:
             msg += f"• `{d['symbol']}` (正): `{d['funding']:.3f}%` | LS:{d['ls']:.2f}\n"
 
+        # 覆盖提示：以前的报告完全不体现"推荐得对不对位"，容易被追高
+        if top_oi:
+            chased = [d for d in top_oi if d.get('year_pos') is not None and not d['is_cheap']]
+            if chased:
+                msg += (f"\n⚠️ 上面 OI 爆增榜里有 {len(chased)} 个不在低位区（"
+                        + "、".join(f"{d['symbol']} {d['year_pos']*100:.0f}%" for d in chased)
+                        + "），属于右侧追高，注意区分\n")
+
         return {
             "message": msg,
             "coins": structured_coins,
             "all_metrics": all_metrics,
+            "low_zone": [d['symbol'] for d in low_zone],
             "timestamp": datetime.now().isoformat()
         }
 
@@ -540,19 +665,41 @@ class LSAnalyzer:
 
 # ==================== OI 持续升温追踪 ====================
 class WarmupTracker:
-    """OI持续升温追踪器：按天聚合存储快照，并检测左侧慢牛候选"""
+    """追踪「OI 缓慢累积」并分类，输出符合「买得便宜」口味的候选。
+
+    2026-09-13 改造（P0-3），四处关键变化：
+
+    1. **窗口 5 天 → 30 天**。"缓慢累积"是周级现象；5 天窗口量到的只是噪音，
+       也正是「持续升温」这条规则占了全部信号 57% 却没人发现的原因。
+    2. **价格语义反转**。原实现把「价格同步上涨」当作 ✅共振确认加分 ——
+       这跟用户口味是相反的。用户要的是「OI 在累积、价格没怎么动」，
+       所以**价格平静才是加分项**，价格猛涨反而是风险。
+    3. **新增价格平静度与 OI-平静比**（OI 涨得多 / 价格振幅小，比值越大越像悄悄建仓）。
+    4. **追高判定**从「距 5 日低点」改为「距窗口低点」，并按用户确认的口径分类：
+         · 底部启动（低位 + OI 增 + 价格平静）→ **要**
+         · 温和共振（OI 增 + |涨跌| ≤ 5%）→ **要**（用户明确要求纳入）
+         · 风险标记（FOMO 追高 / 背离）→ **要**（有信息价值）
+         · 超跌 → **降级**（用户：超跌不一定会涨）
+
+    单独看「OI 涨 + 价格跌」是分不出多空的：可能是多头逢跌吸筹，也可能是空头在加仓。
+    所以对这类候选额外取一次大户多空持仓比（LS）来定性。
+    """
 
     COLLECTION = 'oi_warmup_tracker'
     DOC_ID = 'daily_snapshots'
-    MAX_DAYS = 5
-    MIN_DAYS = 3
+    MAX_DAYS = 30          # 原为 5 天
+    MIN_DAYS = 5           # 至少 5 天才出结论；窗口未满 30 天时逐步生效
+    FLAT_PRICE_PCT = 5.0   # |涨跌| <= 5% 视为「价格平静」（用户口径）
+    CHASE_HIGH_PCT = 15.0  # 距窗口低点涨幅 > 15% 视为追高
+    MIN_OI_GROWTH = 0.5    # 窗口累计 OI 涨幅下限（%）
+    MAX_ENRICH = 40        # 最多给多少个候选补算 LS / 一年分位（控请求量）
 
     def __init__(self, db):
         self.db = db
         self.doc_ref = self.db.collection(self.COLLECTION).document(self.DOC_ID)
 
     def store_daily_snapshot(self, all_metrics: List[Dict]) -> None:
-        """存储当天所有币种快照，按天聚合（保留最后一次），仅保留最近5天"""
+        """存储当天所有币种快照，按天聚合（保留最后一次），仅保留最近 MAX_DAYS 天"""
         if not all_metrics:
             return
 
@@ -593,7 +740,12 @@ class WarmupTracker:
         return []
 
     def detect_oi_sustained_growth(self, snapshots: List[Dict]) -> List[Dict]:
-        """检测 OI 持续升温：过去5天 OI 环比上涨天数>=2（按增长，不看绝对规模），且总趋势向上"""
+        """检测 OI 缓慢累积，并计算价格平静度与位置。
+
+        触发条件：窗口内 OI 至少 2 天环比上涨、末日 > 首日、累计涨幅 >= MIN_OI_GROWTH。
+        排序依据是 **OI-平静比**（OI 涨幅 ÷ 价格振幅）而不是 OI 涨幅本身 ——
+        OI 涨得多但价格也涨得多的，是右侧追高；OI 涨得多而价格很平的，才是要的形态。
+        """
         snapshots = sorted(snapshots, key=lambda x: x.get('date', ''))
         recent = snapshots[-self.MAX_DAYS:]
         if len(recent) < self.MIN_DAYS:
@@ -603,83 +755,162 @@ class WarmupTracker:
         results = []
 
         for symbol in latest_data:
-            oi_series = []
-            price_series = []
+            oi_series, price_series, fr_series = [], [], []
 
             for s in recent:
                 d = s.get('data', {})
                 if symbol in d:
-                    oi_series.append(d[symbol].get('oi', 0))
-                    price_series.append(d[symbol].get('price', 0))
+                    oi_series.append(d[symbol].get('oi', 0) or 0)
+                    price_series.append(d[symbol].get('price', 0) or 0)
+                    fr_series.append(d[symbol].get('fr', 0) or 0)
 
-            if len(oi_series) < self.MIN_DAYS:
+            if len(oi_series) < self.MIN_DAYS or len(price_series) < self.MIN_DAYS:
                 continue
 
-            # 触发：至少2天 OI 环比为正 + 末日 > 首日（净增长）
-            up_days = sum(1 for i in range(1, len(oi_series)) if oi_series[i] > oi_series[i - 1])
-            if up_days < 2:
-                continue
             first_oi, last_oi = oi_series[0], oi_series[-1]
             if first_oi <= 0 or last_oi <= first_oi:
                 continue
 
             oi_change = (last_oi - first_oi) / first_oi * 100
+            if oi_change < self.MIN_OI_GROWTH:
+                continue
 
-            # 确认加分：价格同步上涨（OI+Price 同向）
-            price_up = len(price_series) >= 2 and price_series[0] > 0 and price_series[-1] > price_series[0]
+            up_days = sum(1 for i in range(1, len(oi_series)) if oi_series[i] > oi_series[i - 1])
+            if up_days < 2:
+                continue
 
-            # 减分/排除：价格距5日低点 > 15%（追高风险）
-            chase_high = False
-            if price_series:
-                low = min(price_series)
-                if low > 0:
-                    chase_high = (price_series[-1] - low) / low * 100 > 15
+            p_first, p_last = price_series[0], price_series[-1]
+            if p_first <= 0:
+                continue
+            price_chg = (p_last - p_first) / p_first * 100
+            p_low, p_high = min(price_series), max(price_series)
+
+            # 价格平静度：窗口内振幅，越小越"平"
+            calm = (p_high - p_low) / p_low * 100 if p_low > 0 else 0.0
+            # 距窗口低点涨幅：越大说明越接近"已经涨过"
+            dist_low = (p_last - p_low) / p_low * 100 if p_low > 0 else 0.0
+            # OI-平静比：越大越像"悄悄建仓"
+            oi_calm_ratio = oi_change / max(calm, 0.5)
+
+            # 初分类（未含 LS / 一年分位）
+            if price_chg > self.FLAT_PRICE_PCT:
+                kind, tag = "fomo", "🔴FOMO危险区"
+            elif price_chg >= 0:
+                kind, tag = "mild", "🟢温和共振"
+            elif price_chg >= -self.FLAT_PRICE_PCT:
+                kind, tag = "diverge", "⚪OI增·价微跌"
+            else:
+                kind, tag = "oversold", "💎超跌区间"
 
             results.append({
                 "symbol": symbol,
                 "up_days": up_days,
                 "total_days": len(recent),
                 "oi_change": oi_change,
-                "price_up": price_up,
-                "chase_high": chase_high,
-                "ls": latest_data[symbol].get('ls', 1.0),
-                "cvd": latest_data[symbol].get('cvd', 0),
-                "fr": latest_data[symbol].get('fr', 0),
+                "price_chg": price_chg,
+                "price_range": calm,
+                "dist_low": dist_low,
+                "oi_calm_ratio": oi_calm_ratio,
+                "chase_high": dist_low > self.CHASE_HIGH_PCT,
+                "funding": fr_series[-1] if fr_series else 0.0,
+                "kind": kind,
+                "tag": tag,
+                "ls": None,
+                "direction": "",
+                "year_pos": None,
+                "year_dd": None,
+                "is_cheap": False,
             })
 
-        results.sort(key=lambda x: x['oi_change'], reverse=True)
+        results.sort(key=lambda x: x['oi_calm_ratio'], reverse=True)
         return results
 
+    def enrich_candidates(self, monitor, results: List[Dict]) -> List[Dict]:
+        """给候选补两个关键字段：一年低点分位 + 大户多空比（LS）。
+
+        - **一年分位**：判断"便不便宜"，这是整套系统原先完全缺失的一维。
+        - **LS**：只对「OI 增 + 价格跌」的候选取，用来区分多头吸筹还是空头加仓。
+          不给全部候选取，是为把请求量从 ~150 压到 ~40。
+        """
+        if not results:
+            return results
+        top = results[:self.MAX_ENRICH]
+
+        for r in top:
+            sym = r['symbol']
+            yp = monitor.get_year_position(sym)
+            if yp:
+                r['year_pos'] = yp['pos']
+                r['year_dd'] = yp['dd']
+                r['is_cheap'] = yp['is_cheap']
+            if r['kind'] == 'diverge':
+                ls = monitor.get_ls_ratio(sym)
+                r['ls'] = ls
+                if ls is None:
+                    r['direction'] = "方向未知"
+                elif ls >= 1.0 and r['funding'] >= 0:
+                    r['direction'] = f"多头吸筹(LS {ls:.2f})"
+                else:
+                    r['direction'] = f"⚠️空头加仓(LS {ls:.2f})"
+
+        # 重分类：低位 + 价格平静 + OI 累积 = 用户最要的「底部启动」
+        for r in results:
+            if (r['is_cheap'] and r['kind'] in ('mild', 'diverge')
+                    and abs(r['price_chg']) <= self.FLAT_PRICE_PCT):
+                r['kind'] = 'bottom_start'
+                r['tag'] = "🟢底部启动"
+        results.sort(key=lambda x: (x['kind'] != 'bottom_start', -x['oi_calm_ratio']))
+        return results
+
+
     def format_oi_sustained_growth_message(self, results: List[Dict]) -> str:
+        """按用户确认的优先级分栏输出（要的在前，降级的在后并标注）。"""
         if not results:
             return ""
 
-        clean = [r for r in results if not r['chase_high']]
-        chase = [r for r in results if r['chase_high']]
+        def pos_str(r):
+            if r.get('year_pos') is None:
+                return "位:?"
+            return f"位:{r['year_pos'] * 100:.0f}%" + ("🟢低位" if r['is_cheap'] else "")
+
+        def line(r, extra=""):
+            s = (f"• `{r['symbol']}`: {pos_str(r)} | OI累计{r['oi_change']:+.1f}%"
+                 f" | 价{r['price_chg']:+.1f}% | 振幅{r['price_range']:.1f}%")
+            if extra:
+                s += f" | {extra}"
+            return s
+
+        groups = [
+            ("bottom_start", "🟢 **【底部启动】低位 + OI 累积 + 价格平静**", lambda r: ""),
+            ("mild", "🟢 **【OI 温和累积】价格平静（|涨跌| ≤ 5%）**", lambda r: ""),
+            ("diverge", "⚪ **【OI 增 · 价格微跌】需分多空**", lambda r: r.get('direction', "")),
+            ("fomo", "🔴 **【风险标记】OI 增但价格已冲高（右侧）**", lambda r: "追高"),
+            ("oversold", "💎 **【超跌区间】仅供参考 —— 超跌不必然反弹**", lambda r: ""),
+        ]
 
         parts = []
-        if clean:
-            parts.append(f"🔥 **【OI持续升温】**\n发现 {len(clean)} 个候选：\n")
-            for r in clean:
-                tag = "共振确认" if r['price_up'] else "价格未确认"
-                parts.append(f"• `{r['symbol']}` 🔥持续升温+{tag}")
-                parts.append(f"  OI连续上涨 {r['up_days']} 天 | OI {r['oi_change']:+.1f}%")
-                parts.append(f"  费率:{r['fr']:.3f}%")
-                parts.append("")
-
-        if chase:
-            parts.append(f"⚠️ **【追高风险】** 价格已从5日低点涨>15%：\n")
-            for r in chase:
-                parts.append(f"• `{r['symbol']}` OI上涨 {r['up_days']} 天 | OI {r['oi_change']:+.1f}%")
+        for kind, title, extra_fn in groups:
+            rows = [r for r in results if r['kind'] == kind]
+            if not rows:
+                continue
+            parts.append(f"{title}（{len(rows)}）")
+            for r in rows[:6]:
+                parts.append(line(r, extra_fn(r)))
             parts.append("")
 
+        parts.append("位=一年低点分位(越小越便宜) | 振幅=窗口内价格波动幅度 | "
+                     "同 OI 涨幅下振幅越小越像「悄悄建仓」")
         return "\n".join(parts).rstrip()
 
-    def oi_sustained_growth_scan(self, all_metrics: List[Dict]) -> str:
-        """存储每日快照并检测 OI 持续升温，返回 Telegram 消息片段"""
+    def oi_sustained_growth_scan(self, all_metrics: List[Dict], monitor=None) -> str:
+        """存储每日快照 → 检测 OI 缓慢累积 → 补 LS/一年分位 → 生成消息片段"""
         self.store_daily_snapshot(all_metrics)
         snapshots = self.get_history()
         results = self.detect_oi_sustained_growth(snapshots)
+        if not results:
+            return ""
+        if monitor is not None:
+            results = self.enrich_candidates(monitor, results)
         return self.format_oi_sustained_growth_message(results)
 
 # ==================== 主入口 ====================
@@ -691,12 +922,13 @@ def main():
         monitor = OIMonitor(config.bot_token, config.chat_id)
 
         if mode == 'warmup':
-            # 升温模式：轻扫 >$5M 池子，存快照并检测 OI 持续升温
+            # 升温模式：轻扫 >$5M 池子，存快照并检测「OI 缓慢累积」
+            # 检测后会只给候选币补算 LS 与一年低点分位（~40 次请求，不给全部 150 个）
             all_metrics = monitor.scan_light(threshold=5_000_000)
             if not all_metrics:
                 logger.error("轻量扫描失败，跳过本次升温检测")
                 return
-            warmup_msg = WarmupTracker(fb.db).oi_sustained_growth_scan(all_metrics)
+            warmup_msg = WarmupTracker(fb.db).oi_sustained_growth_scan(all_metrics, monitor=monitor)
             if warmup_msg:
                 monitor.send_telegram(warmup_msg)
                 logger.info("OI 持续升温报告发送成功")
