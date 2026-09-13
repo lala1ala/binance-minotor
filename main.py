@@ -1,10 +1,13 @@
 import os
 import sys
 import json
+import time
 import logging
+import threading
 import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
@@ -72,15 +75,33 @@ class FirebaseManager:
 
 # ==================== OI 监控核心逻辑 ====================
 class OIMonitor:
+    # ---- 网络策略参数 ----
+    # 原实现最坏情况：5s 直连 + 10 个代理 × 5s = 55s / 请求，乘以约 600 次请求 ≈ 9 小时
+    DIRECT_TIMEOUT = 8         # 直连超时（秒）
+    PROXY_TIMEOUT = 6          # 单个代理超时（秒）
+    MAX_PROXY_RETRIES = 3      # 单请求最多试几个代理（原来是 10）
+    MAX_WORKERS = 8            # 并发取数线程数
+    SCAN_BUDGET_SECONDS = 600  # 单次扫描总时间预算（10 分钟），到点就用已有数据出报告
+    TELEGRAM_MAX_LEN = 4000    # Telegram 单条消息上限，超出自动分片
+
     def __init__(self, bot_token, chat_id):
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.proxies = []
         self.proxy_index = 0
+        # 直连健康状态：None=未知 / True=可用 / False=已连续失败
+        self._direct_ok = None
+        self._direct_fail_streak = 0
+        # 记住最近一次成功的代理，后续请求优先复用，省掉反复试探
+        self._good_proxy = None
+        # 并发场景下保护上面几个共享状态
+        self._lock = threading.Lock()
 
     def get_public_proxies(self):
         """从公共源获取最新代理列表"""
-        if self.proxies: return
+        with self._lock:
+            if self.proxies:
+                return
         try:
             logger.info("正在获取公共代理列表...")
             # 使用 reliable 的 GitHub 代理列表源
@@ -89,46 +110,81 @@ class OIMonitor:
             if resp.status_code == 200:
                 # 只取前50个，避免太久
                 all_proxies = resp.text.splitlines()[:50]
-                self.proxies = [{"http": f"http://{p}", "https": f"http://{p}"} for p in all_proxies]
-                logger.info(f"成功获取 {len(self.proxies)} 个代理")
+                with self._lock:
+                    self.proxies = [{"http": f"http://{p}", "https": f"http://{p}"} for p in all_proxies]
+                logger.info(f"成功获取 {len(all_proxies)} 个代理")
         except Exception as e:
             logger.error(f"获取代理失败: {e}")
 
-    def request_with_retry(self, url):
-        """带代理重试的请求封装"""
-        # 1. 先尝试直连
-        try:
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                # 检查是否是 API 错误响应 (dict 且包含 code/msg)
-                if isinstance(data, dict) and ('code' in data or 'msg' in data):
-                     # 如果是 IP 限制，抛出异常进入代理重试
-                     if "restricted" in str(data.get('msg', '')):
-                         raise ValueError("IP Restricted")
-                return data
-        except Exception as e:
-            logger.warning(f"直连失败 ({e})，尝试使用代理...")
+    @staticmethod
+    def _try_request(url, timeout, proxy=None):
+        """单次请求：成功返回解析后的 JSON，失败返回 None。
 
-        # 2. 直连失败，准备代理
+        把"什么算失败"集中在一处：非 200、币安限流/受限时返回的
+        {"code":...,"msg":...} 错误体、以及任何网络异常。
+        """
+        try:
+            resp = requests.get(url, proxies=proxy, timeout=timeout)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if isinstance(data, dict) and 'code' in data:
+                return None
+            return data
+        except Exception:
+            return None
+
+    def request_with_retry(self, url, timeout=None, allow_proxy=True):
+        """带降级重试的请求封装。
+
+        按成本从低到高依次尝试：
+          1. 直连 —— 连续失败 3 次后，本次运行不再为每个请求白等一次超时
+          2. 复用上一次成功的那个代理
+          3. 最多再试 MAX_PROXY_RETRIES 个候选代理
+
+        单请求最坏耗时：5 + 10×5 = 55s  →  8 + 3×6 = 26s。
+        """
+        timeout = timeout or self.DIRECT_TIMEOUT
+
+        # --- 1. 直连 ---
+        if self._direct_ok is not False:
+            data = self._try_request(url, timeout=timeout)
+            if data is not None:
+                with self._lock:
+                    self._direct_ok = True
+                    self._direct_fail_streak = 0
+                return data
+            with self._lock:
+                self._direct_fail_streak += 1
+                if self._direct_fail_streak >= 3 and self._direct_ok is not False:
+                    logger.warning("直连连续失败 3 次，本次运行改为代理优先")
+                    self._direct_ok = False
+
+        if not allow_proxy:
+            return None
+
+        # --- 2. 复用上次成功的代理 ---
+        with self._lock:
+            good = self._good_proxy
+        if good is not None:
+            data = self._try_request(url, timeout=timeout, proxy=good)
+            if data is not None:
+                return data
+            with self._lock:
+                self._good_proxy = None
+
+        # --- 3. 候选代理 ---
         self.get_public_proxies()
-        
-        # 3. 遍历代理尝试
-        max_retries = 10  # 最多试10个代理
-        for i in range(min(len(self.proxies), max_retries)):
-            proxy = self.proxies[i]
-            try:
-                logger.info(f"正在尝试代理 [{i+1}/{max_retries}]...")
-                resp = requests.get(url, proxies=proxy, timeout=5)
-                if resp.status_code == 200:
-                    data = resp.json()
-                     # 再次检查内容有效性
-                    if isinstance(data, dict) and 'code' in data:
-                        continue # 这个代理也被墙了，换下一个
-                    return data
-            except:
-                continue
-        
+        with self._lock:
+            candidates = list(self.proxies[:self.MAX_PROXY_RETRIES])
+        for i, proxy in enumerate(candidates, 1):
+            logger.info(f"尝试代理 [{i}/{len(candidates)}]...")
+            data = self._try_request(url, timeout=timeout, proxy=proxy)
+            if data is not None:
+                with self._lock:
+                    self._good_proxy = proxy
+                return data
+
         # 全都失败
         return None
 
@@ -144,7 +200,8 @@ class OIMonitor:
             hist_url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=2h&limit=2"
             hist_resp = self.request_with_retry(hist_url)
             
-            if not hist_resp or not isinstance(hist_resp, list):
+            # 注意：空列表也要挡住，否则下面的 hist_resp[0] 会抛 IndexError
+            if not isinstance(hist_resp, list) or not hist_resp:
                 return oi_now, 0, 1.0
 
             oi_2h_ago = float(hist_resp[0]['sumOpenInterest'])
@@ -153,7 +210,9 @@ class OIMonitor:
             # LS Ratio（过去2小时）
             ls_url = f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={symbol}&period=2h&limit=1"
             ls_resp = self.request_with_retry(ls_url)
-            ls_ratio = float(ls_resp[0]['longShortRatio']) if ls_resp else 1.0
+            ls_ratio = 1.0
+            if isinstance(ls_resp, list) and ls_resp:
+                ls_ratio = float(ls_resp[0]['longShortRatio'])
 
             return oi_now, oi_growth, ls_ratio
         except Exception as e:
@@ -193,6 +252,87 @@ class OIMonitor:
             logger.error(f"Error fetching light OI {symbol}: {e}")
         return 0.0
 
+    def _collect_one(self, ticker: Dict, premium: Optional[Dict]) -> Optional[Dict]:
+        """采集单个交易对的全部指标（供并发调用）。失败返回 None。"""
+        s = ticker['symbol']
+        try:
+            oi_val, oi_chg, ls = self.get_real_oi_growth(s)
+            cvd_usdt = self.get_cvd_2h_usdt(s)
+            funding = float(premium['lastFundingRate']) * 100 if premium else 0
+            return {
+                "symbol": s,
+                "price": float(ticker['lastPrice']),
+                "price_chg": float(ticker['priceChangePercent']),
+                "oi_value": oi_val,
+                "oi_chg": oi_chg,
+                "ls": ls,
+                "cvd_usdt": cvd_usdt,
+                "funding": funding,
+            }
+        except Exception as e:
+            logger.error(f"采集 {s} 失败: {e}")
+            return None
+
+    def _light_one(self, ticker: Dict, premium: Optional[Dict]) -> Optional[Dict]:
+        """轻量采集单个交易对（升温模式：只要 OI + 价格 + 费率）。"""
+        s = ticker['symbol']
+        try:
+            return {
+                "symbol": s,
+                "price": float(ticker['lastPrice']),
+                "price_chg": float(ticker['priceChangePercent']),
+                "oi_value": self.get_light_oi(s),
+                "oi_chg": 0,
+                "ls": 1.0,
+                "cvd_usdt": 0,
+                "funding": float(premium['lastFundingRate']) * 100 if premium else 0,
+            }
+        except Exception as e:
+            logger.error(f"轻量采集 {s} 失败: {e}")
+            return None
+
+    def _run_concurrent(self, tickers: List[Dict], worker) -> Dict[str, Dict]:
+        """并发执行 worker(ticker)，返回 {symbol: data_point}。
+
+        - 并发度 MAX_WORKERS，远低于币安 fapi 的权重上限（2400/分钟），不会触发限流
+        - 总耗时受 SCAN_BUDGET_SECONDS 约束：到点即停止等待，用已拿到的数据出报告，
+          而不是像原来那样把 600 次串行请求一路拖到 4~5 小时
+        """
+        results: Dict[str, Dict] = {}
+        total = len(tickers)
+        if not total:
+            return results
+
+        deadline = time.monotonic() + self.SCAN_BUDGET_SECONDS
+        started = time.monotonic()
+        logger.info(f"并发采集 {total} 个交易对（并发度 {self.MAX_WORKERS}，预算 {self.SCAN_BUDGET_SECONDS}s）...")
+
+        pool = ThreadPoolExecutor(max_workers=self.MAX_WORKERS)
+        try:
+            futures = {pool.submit(worker, t): t['symbol'] for t in tickers}
+            for done, fut in enumerate(as_completed(futures), 1):
+                symbol = futures[fut]
+                try:
+                    row = fut.result()
+                except Exception as e:
+                    logger.error(f"{symbol} 采集异常: {e}")
+                    row = None
+                if row is not None:
+                    results[symbol] = row
+                if done % 25 == 0:
+                    logger.info(f"  进度 {done}/{total}，已成功 {len(results)}")
+                if time.monotonic() > deadline:
+                    logger.warning(
+                        f"已达 {self.SCAN_BUDGET_SECONDS}s 预算，停止等待剩余 {total - done} 个交易对"
+                    )
+                    break
+        finally:
+            # 不等未完成的任务；单请求本身有超时，残留线程最多再跑 26s 就会自己结束
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        logger.info(f"并发采集结束：{len(results)}/{total} 成功，耗时 {time.monotonic() - started:.1f}s")
+        return results
+
     def scan_and_collect(self, threshold: float = 10_000_000) -> Dict:
         """扫描市场并返回结构化数据和报告文本"""
         logger.info("开始币安OI扫描...")
@@ -227,26 +367,16 @@ class OIMonitor:
         ]
         active_tickers.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
 
-        all_metrics = []
         structured_coins = {} # 用于存入数据库
+        total = len(active_tickers)
 
-        for t in active_tickers:
-            s = t['symbol']
-            oi_val, oi_chg, ls = self.get_real_oi_growth(s)
-            cvd_usdt = self.get_cvd_2h_usdt(s)
-            funding = float(premiums[s]['lastFundingRate']) * 100 if s in premiums else 0
-            
-            data_point = {
-                "symbol": s,
-                "price": float(t['lastPrice']),
-                "price_chg": float(t['priceChangePercent']),
-                "oi_value": oi_val,
-                "oi_chg": oi_chg,
-                "ls": ls,
-                "cvd_usdt": cvd_usdt,
-                "funding": funding
-            }
-            all_metrics.append(data_point)
+        # 并发取数（原来是完全串行的 for 循环：约 600 次请求，最坏每次 55s，合计 4~5 小时）
+        collected = self._run_concurrent(
+            active_tickers,
+            lambda t: self._collect_one(t, premiums.get(t['symbol'])),
+        )
+        # 按 24h 成交额降序还原顺序，保证报告内容与原实现一致、可复现
+        all_metrics = [collected[t['symbol']] for t in active_tickers if t['symbol'] in collected]
 
         # 筛选逻辑
         # 低位埋伏: 价格未暴涨(-2%到5%), OI增加, 大户多, 且CVD纯买入>0
@@ -268,7 +398,12 @@ class OIMonitor:
 
         # 构造报告文本
         beijing_time = datetime.utcnow() + timedelta(hours=8)
-        msg = f"🛰️ **【{beijing_time.strftime('%H:%M')} 真实持仓扫描 (GHA版)】**\n\n"
+        msg = f"🛰️ **【{beijing_time.strftime('%H:%M')} 真实持仓扫描 (GHA版)】**\n"
+        # 把数据完整度写进报告：以前报告残缺时你完全看不出来
+        msg += f"📊 数据完整度: {len(all_metrics)}/{total}"
+        if total and len(all_metrics) < total * 0.9:
+            msg += " ⚠️ 部分交易对取数失败，榜单可能不完整"
+        msg += "\n\n"
         
         msg += "💎 **低位埋伏 (横盘+OI增+大户多+CVD净买入)**\n"
         if not accumulation: msg += "• 暂无匹配\n"
@@ -301,8 +436,8 @@ class OIMonitor:
     def scan_light(self, threshold: float = 5_000_000) -> List[Dict]:
         """轻量扫描：只取 OI + 价格 + 费率（不取CVD/多空比），用于每日升温快照"""
         logger.info("开始轻量 OI 扫描（升温模式）...")
-        t_resp = self.request_with_retry("https://fapi.binance.com/fapi/v1/ticker/24hr")
-        p_resp = self.request_with_retry("https://fapi.binance.com/fapi/v1/premiumIndex")
+        t_resp = self.request_with_retry("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=20)
+        p_resp = self.request_with_retry("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=15)
 
         if not t_resp or not isinstance(t_resp, list):
             logger.error("轻量扫描失败：ticker API 错误")
@@ -316,27 +451,45 @@ class OIMonitor:
         ]
         active_tickers.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
 
-        all_metrics = []
-        for t in active_tickers:
-            s = t['symbol']
-            data_point = {
-                "symbol": s,
-                "price": float(t['lastPrice']),
-                "price_chg": float(t['priceChangePercent']),
-                "oi_value": self.get_light_oi(s),
-                "oi_chg": 0,
-                "ls": 1.0,
-                "cvd_usdt": 0,
-                "funding": float(premiums[s]['lastFundingRate']) * 100 if s in premiums else 0,
-            }
-            all_metrics.append(data_point)
+        # 并发取数：升温模式每币 1 次请求，串行同样会被降级路径拖慢
+        collected = self._run_concurrent(
+            active_tickers,
+            lambda t: self._light_one(t, premiums.get(t['symbol'])),
+        )
+        all_metrics = [collected[t['symbol']] for t in active_tickers if t['symbol'] in collected]
 
-        logger.info(f"轻量扫描完成，共 {len(all_metrics)} 个币")
+        logger.info(f"轻量扫描完成，共 {len(all_metrics)}/{len(active_tickers)} 个币")
         return all_metrics
 
+    def _split_message(self, text: str) -> List[str]:
+        """按行分片，保证每片不超过 Telegram 单条消息上限。"""
+        limit = self.TELEGRAM_MAX_LEN
+        if len(text) <= limit:
+            return [text]
+        chunks, buf = [], ""
+        for line in text.split("\n"):
+            if len(buf) + len(line) + 1 > limit:
+                chunks.append(buf)
+                buf = ""
+            buf += line + "\n"
+        if buf:
+            chunks.append(buf)
+        return chunks
+
     def send_telegram(self, text):
+        """发送 Telegram 消息：超长自动分片，失败记日志而不是静默吞掉。"""
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        requests.post(url, json={"chat_id": self.chat_id, "text": text, "parse_mode": "Markdown"})
+        for chunk in self._split_message(text):
+            try:
+                resp = requests.post(
+                    url,
+                    json={"chat_id": self.chat_id, "text": chunk, "parse_mode": "Markdown"},
+                    timeout=20,
+                )
+                if resp.status_code != 200:
+                    logger.error(f"Telegram 发送失败: {resp.status_code} {resp.text[:200]}")
+            except Exception as e:
+                logger.error(f"Telegram 发送异常: {e}")
 
 # ==================== LS 分析逻辑 ====================
 class LSAnalyzer:

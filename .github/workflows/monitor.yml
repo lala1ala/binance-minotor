@@ -6,6 +6,10 @@ on:
     - cron: '0 */2 * * *'
   workflow_dispatch: # 允许手动点击运行测试
 
+# 最小权限：只需要读取代码
+permissions:
+  contents: read
+
 concurrency:
   group: binance-monitor
   cancel-in-progress: false
@@ -13,13 +17,17 @@ concurrency:
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
-    
+    # 硬上限：脚本内部有 10 分钟扫描预算，20 分钟足够收尾。
+    # 改造前这里靠 GitHub 默认的 6 小时兜底 —— 实测中位数 266 分钟、
+    # 最长 425 分钟，与下一次 2 小时调度重叠，25 次里有 5 次被 cancelled。
+    timeout-minutes: 20
+
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.9'
         cache: 'pip'

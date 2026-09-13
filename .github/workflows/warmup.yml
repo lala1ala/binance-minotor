@@ -6,15 +6,24 @@ on:
     - cron: '0 1 * * *'
   workflow_dispatch:
 
+# 最小权限：只需要读取代码
+permissions:
+  contents: read
+
+concurrency:
+  group: binance-warmup
+  cancel-in-progress: false
+
 jobs:
   run-warmup:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
           cache: 'pip'
