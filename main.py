@@ -92,6 +92,14 @@ class OIMonitor:
     YEAR_LOOKBACK_DAYS = 365   # 回看天数
     YEAR_MIN_BARS = 60         # 少于 60 根日线就不下结论（次新币不参与判定）
 
+    # ---- OI 存量分位闸门 ----
+    # 这是 419 条历史信号回测里**唯一**能把信号从噪音中分出来的维度（见 get_oi_position 注释）。
+    #   oi_pos = 当前 OI 在最近 N 天 OI 序列中的分位（0 = 窗口最低，1 = 窗口最高）
+    #   oi_pos 越低 = 杠杆水位越低 = 这个币还没被堆杠杆
+    OI_POS_DAYS = 30           # OI 分位窗口（天）。币安 openInterestHist 最多只提供 30 天
+    OI_POS_MAX = 0.25          # oi_pos <= 0.25 视为「杠杆低位」
+    OI_POS_MIN_BARS = 14       # 少于 14 根不下结论
+
     # 「价格平静」口径：用户明确要求「OI 和价格同向、但涨跌不超过 5% 也可纳入信号」。
     # 所以不是"价格不涨"才算好，而是 |涨跌| <= 5% 且 OI 在累积就值得看。
     FLAT_PRICE_PCT = 5.0
@@ -301,6 +309,66 @@ class OIMonitor:
             logger.error(f"一年低点分位计算失败 {symbol}: {e}")
             return None
 
+    def get_oi_position(self, symbol: str) -> Optional[Dict]:
+        """OI 存量分位：这个币的杠杆水位，处在最近一段时间的什么位置。
+
+        为什么加这一维（这不是拍脑袋，是把 419 条历史信号回填价格后算出来的）:
+
+            筛选条件            样本    7d 超额中位   胜率
+            全体基线            419     −1.52%       41%
+            oi_pos <= 10%        16     −1.02%       50%
+            oi_pos <= 15%        19     +2.87%       53%
+            oi_pos <= 20%        27     +2.13%       59%
+            oi_pos <= 25%        30     +2.50%       60%   ← 闸门取此
+            oi_pos >= 50%       135     −4.56%       36%
+            oi_pos >= 70%       124     −4.55%       36%
+
+        关键对比：当前系统推出来的币，`OI分位` 的**中位数高达 96.7%**，
+        也就是说推得最多的，恰好是「杠杆已经堆到窗口最高位」的那一档，
+        而那一档的中位数是 −4.55%。这不是运气不好，是系统性偏向。
+
+        再叠一层「价格平静」（|24h 涨跌| <= 3%）：样本 21，7d 中位 +2.87%、
+        均值 +5.06%、胜率 67% —— 这才是用户要的「底部蓄力」形状。
+
+        口径说明（已用币安真实数据反推校验）：
+          - 用日线 OI（sumOpenInterest，张数口径），与表里 `OI变化%` 列
+            5/5 完全一致（AAVE −1.23% / RENDER +3.49% / ETHFI +2.80% /
+            NEAR −4.75% / FET −2.61%），证明两边同源，可完全复现。
+          - 分位取「存量水平」在窗口内的排名，而非「变动」的排名：
+            FET 当日 OI 恰为窗口最低值，表里记 `0.0%`，0/14 完美命中。
+
+        返回: pos / value / low / high / days / is_low
+        """
+        try:
+            url = (f"https://fapi.binance.com/futures/data/openInterestHist"
+                   f"?symbol={symbol}&period=1d&limit={self.OI_POS_DAYS}")
+            resp = self.request_with_retry(url)
+            if not isinstance(resp, list) or len(resp) < self.OI_POS_MIN_BARS:
+                return None
+            vals = [float(x['sumOpenInterest']) for x in resp]
+            cur = vals[-1]
+            lo, hi = min(vals), max(vals)
+            if hi <= lo or cur <= 0:
+                # 窗口内 OI 完全不动：无所谓高低，按最低位处理
+                return {"pos": 0.0, "value": cur, "low": lo, "high": hi,
+                        "days": len(vals), "is_low": True}
+            n = len(vals)
+            below = sum(1 for v in vals if v < cur)
+            above = sum(1 for v in vals if v > cur)
+            # 平局用 (below + (n-below-above)/2) / n 处理，避免除数偏差
+            pos = (below + (n - below - above) / 2.0) / n if (below + above) < n else below / n
+            return {
+                "pos": pos,
+                "value": cur,
+                "low": lo,
+                "high": hi,
+                "days": n,
+                "is_low": pos <= self.OI_POS_MAX,
+            }
+        except Exception as e:
+            logger.error(f"OI 存量分位计算失败 {symbol}: {e}")
+            return None
+
     def get_ls_ratio(self, symbol: str) -> Optional[float]:
         """大户多空持仓比（topLongShortPositionRatio, 2h）。
 
@@ -317,20 +385,24 @@ class OIMonitor:
             logger.error(f"LS 获取失败 {symbol}: {e}")
         return None
 
-    def enrich_year_position(self, symbols: List[str]) -> Dict[str, Dict]:
-        """只为候选币补算一年低点分位。
+    def enrich_positions(self, symbols: List[str]) -> Dict[str, Dict]:
+        """只为候选币补算「两个位置」：价格一年分位 + OI 存量分位。
 
-        不给全部 ~150 个币算：每个币要多 1 次请求（365 根日线，payload 不小）。
-        只对已经进入候选池的币算，请求量从 ~150 降到 ~20。
+        不给全部 ~150 个币算：每个币要多 2 次请求（365 根日线 + 30 天 OI），
+        payload 不小。只对已经进入候选池的币算，请求量从 ~300 降到 ~40。
+
+        返回 {symbol: {"yp": 一年分位 or None, "oip": OI 分位 or None}}
         """
         symbols = [s for s in dict.fromkeys(symbols) if s]  # 去重保序
         if not symbols:
             return {}
-        out = self._run_concurrent(
-            [{"symbol": s} for s in symbols],
-            lambda t: {"symbol": t["symbol"], "yp": self.get_year_position(t["symbol"])},
-        )
-        return {s: d["yp"] for s, d in out.items() if d.get("yp")}
+
+        def _one(t):
+            s = t["symbol"]
+            return {"symbol": s, "yp": self.get_year_position(s), "oip": self.get_oi_position(s)}
+
+        out = self._run_concurrent([{"symbol": s} for s in symbols], _one)
+        return {s: {"yp": d.get("yp"), "oip": d.get("oip")} for s, d in out.items()}
 
     def _collect_one(self, ticker: Dict, premium: Optional[Dict]) -> Optional[Dict]:
         """采集单个交易对的全部指标（供并发调用）。失败返回 None。"""
@@ -465,32 +537,63 @@ class OIMonitor:
         ext_neg = sorted([d for d in all_metrics if d['funding'] < 0], key=lambda x: x['funding'])[:3]
         ext_pos = sorted([d for d in all_metrics if d['funding'] > 0], key=lambda x: x['funding'], reverse=True)[:3]
 
-        # ---- 一年低点分位：只给候选币补算，避免 150 次额外请求 ----
-        candidate_syms = [d['symbol'] for d in accumulation] + [d['symbol'] for d in top_oi]
-        yp_map = self.enrich_year_position(candidate_syms)
+        # ---- 两个位置：只给候选币补算，避免 ~300 次额外请求 ----
+        # 候选池 = 低位埋伏 + OI爆增 + 「OI 温和累积且价格平静」的形状
+        quiet = [d for d in all_metrics
+                 if d['oi_chg'] > self.OI_GROWTH_MIN
+                 and abs(d['price_chg']) <= self.FLAT_PRICE_PCT]
+        quiet.sort(key=lambda x: x['oi_chg'], reverse=True)
+        candidate_syms = ([d['symbol'] for d in accumulation]
+                          + [d['symbol'] for d in top_oi]
+                          + [d['symbol'] for d in quiet[:30]])
+        pos_map = self.enrich_positions(candidate_syms)
         for d in all_metrics:
-            yp = yp_map.get(d['symbol'])
+            pm = pos_map.get(d['symbol']) or {}
+            yp, oip = pm.get('yp'), pm.get('oip')
             d['year_pos'] = yp['pos'] if yp else None
             d['year_dd'] = yp['dd'] if yp else None
             d['is_cheap'] = bool(yp and yp['is_cheap'])
+            d['oi_pos'] = oip['pos'] if oip else None
+            d['oi_low'] = oip['low'] if oip else None
+            d['oi_high'] = oip['high'] if oip else None
+            d['is_oi_low'] = bool(oip and oip['is_low'])
 
         def pos_tag(d):
-            """位置标签：位:12%🟢低位 / 位:63% / 位:?"""
-            if d.get('year_pos') is None:
-                return "位:?"
-            tag = f"位:{d['year_pos'] * 100:.0f}%"
-            return tag + ("🟢低位" if d['is_cheap'] else "")
+            """位置标签，两个维度分开显示：杠杆位:8%🟢 价位:12%🟢"""
+            parts = []
+            if d.get('oi_pos') is not None:
+                parts.append(f"杠杆位:{d['oi_pos'] * 100:.0f}%"
+                             + ("🟢" if d.get('is_oi_low') else ""))
+            else:
+                parts.append("杠杆位:?")
+            if d.get('year_pos') is not None:
+                parts.append(f"价位:{d['year_pos'] * 100:.0f}%"
+                             + ("🟢" if d.get('is_cheap') else ""))
+            else:
+                parts.append("价位:?")
+            return " ".join(parts)
 
-        # 用户核心口径：位置便宜 + OI 在累积 + 价格没怎么动
+        # 用户核心口径：杠杆水位低 + OI 在缓慢累积 + 价格没怎么动
         # （|涨跌| <= 5%，含小幅上涨；这才是"悄悄建仓"的形状）
+        #
+        # 闸门用「杠杆位」而不是「价位」，是回测选出来的，不是偏好问题：
+        #   对照组「OI 涨>1% 且价格平静、但不限分位」样本 75、7d 中位 −0.16%、
+        #   胜率 44%（≈噪音）；加上 oi_pos<=25% 后样本 15、中位 +2.92%、胜率 67%。
+        #   说明**约束来自分位，不来自 OI 涨幅**。
+        # 价位仍会显示在标签里（用户关心"近一年新低附近"），但没有历史样本
+        # 可以验证它，所以不敢拿它当闸门 —— 宁可少一个好条件，不乱加。
         low_zone = [
             d for d in all_metrics
-            if d.get('is_cheap')
+            if d.get('is_oi_low')
             and d['oi_chg'] > self.OI_GROWTH_MIN
             and abs(d['price_chg']) <= self.FLAT_PRICE_PCT
         ]
         low_zone.sort(key=lambda x: x['oi_chg'], reverse=True)
         low_zone_syms = {d['symbol'] for d in low_zone}
+
+        # 反向提示：OI 已在高位的币，别当低位机会
+        high_leverage = [d for d in all_metrics
+                         if d.get('oi_pos') is not None and d['oi_pos'] >= 0.90]
 
         # 金额格式化小工具
         def format_usd(val):
@@ -512,12 +615,13 @@ class OIMonitor:
             msg += " ⚠️ 部分交易对取数失败，榜单可能不完整"
         msg += "\n"
 
-        # ① 最符合口味的一栏放在最前面：便宜 + OI 累积 + 价格平静
-        msg += f"\n🟢 **低位区·OI静默累积 (一年分位≤25% + OI增 + |涨跌|≤5%)**\n"
+        # ① 最符合口味的一栏放在最前面：杠杆低位 + OI 累积 + 价格平静
+        msg += f"\n🟢 **低位区·OI静默累积 (杠杆位≤25% + OI增 + |涨跌|≤5%)**\n"
         if not low_zone:
             msg += "• 暂无匹配\n"
         for d in low_zone[:8]:
-            msg += (f"• `{d['symbol']}`: {pos_tag(d)} | DD{d['year_dd']:+.0f}% "
+            dd = f" | DD{d['year_dd']:+.0f}%" if d.get('year_dd') is not None else ""
+            msg += (f"• `{d['symbol']}`: {pos_tag(d)}{dd} "
                     f"| OI:+{d['oi_chg']:.1f}% | 价:{d['price_chg']:+.1f}%\n")
             structured_coins[d['symbol']] = {"ls_value": d['ls'], "section": "low_zone", "extra_info": ""}
 
@@ -544,11 +648,15 @@ class OIMonitor:
 
         # 覆盖提示：以前的报告完全不体现"推荐得对不对位"，容易被追高
         if top_oi:
-            chased = [d for d in top_oi if d.get('year_pos') is not None and not d['is_cheap']]
+            chased = [d for d in top_oi if d.get('oi_pos') is not None and not d['is_oi_low']]
             if chased:
-                msg += (f"\n⚠️ 上面 OI 爆增榜里有 {len(chased)} 个不在低位区（"
-                        + "、".join(f"{d['symbol']} {d['year_pos']*100:.0f}%" for d in chased)
+                msg += (f"\n⚠️ 上面 OI 爆增榜里有 {len(chased)} 个杠杆位不在低位（"
+                        + "、".join(f"{d['symbol']} {d['oi_pos']*100:.0f}%" for d in chased)
                         + "），属于右侧追高，注意区分\n")
+        if high_leverage:
+            msg += (f"📉 杠杆位≥90% 的标的有 {len(high_leverage)} 个"
+                    f"（历史样本：这一档 7d 超额中位 −4.89%、胜率 37%），"
+                    "别把它们当低位机会\n")
 
         return {
             "message": msg,
@@ -692,7 +800,7 @@ class WarmupTracker:
     FLAT_PRICE_PCT = 5.0   # |涨跌| <= 5% 视为「价格平静」（用户口径）
     CHASE_HIGH_PCT = 15.0  # 距窗口低点涨幅 > 15% 视为追高
     MIN_OI_GROWTH = 0.5    # 窗口累计 OI 涨幅下限（%）
-    MAX_ENRICH = 40        # 最多给多少个候选补算 LS / 一年分位（控请求量）
+    MAX_ENRICH = 40        # 最多给多少个候选补算 OI分位/一年分位/LS（控请求量：上限 40×3）
 
     def __init__(self, db):
         self.db = db
@@ -820,17 +928,22 @@ class WarmupTracker:
                 "year_pos": None,
                 "year_dd": None,
                 "is_cheap": False,
+                "oi_pos": None,
+                "oi_low": None,
+                "oi_high": None,
+                "is_oi_low": False,
             })
 
         results.sort(key=lambda x: x['oi_calm_ratio'], reverse=True)
         return results
 
     def enrich_candidates(self, monitor, results: List[Dict]) -> List[Dict]:
-        """给候选补两个关键字段：一年低点分位 + 大户多空比（LS）。
+        """给候选补三个关键字段：OI 存量分位 + 一年低点分位 + 大户多空比（LS）。
 
+        - **OI 存量分位**：回测里唯一真正管用的一维（见 OIMonitor.get_oi_position）。
         - **一年分位**：判断"便不便宜"，这是整套系统原先完全缺失的一维。
         - **LS**：只对「OI 增 + 价格跌」的候选取，用来区分多头吸筹还是空头加仓。
-          不给全部候选取，是为把请求量从 ~150 压到 ~40。
+          不给全部候选取，是为把请求量从 ~450 压到 ~90。
         """
         if not results:
             return results
@@ -838,6 +951,12 @@ class WarmupTracker:
 
         for r in top:
             sym = r['symbol']
+            oip = monitor.get_oi_position(sym)
+            if oip:
+                r['oi_pos'] = oip['pos']
+                r['oi_low'] = oip['low']
+                r['oi_high'] = oip['high']
+                r['is_oi_low'] = oip['is_low']
             yp = monitor.get_year_position(sym)
             if yp:
                 r['year_pos'] = yp['pos']
@@ -853,12 +972,15 @@ class WarmupTracker:
                 else:
                     r['direction'] = f"⚠️空头加仓(LS {ls:.2f})"
 
-        # 重分类：低位 + 价格平静 + OI 累积 = 用户最要的「底部启动」
+        # 重分类：杠杆位低 + 价格平静 + OI 累积 = 用户最要的「底部启动」。
+        # 闸门用杠杆位（已验证），不用价位的理由见 report() 里的注释。
         for r in results:
-            if (r['is_cheap'] and r['kind'] in ('mild', 'diverge')
+            if (r['is_oi_low'] and r['kind'] in ('mild', 'diverge')
                     and abs(r['price_chg']) <= self.FLAT_PRICE_PCT):
                 r['kind'] = 'bottom_start'
                 r['tag'] = "🟢底部启动"
+                if r['is_cheap']:
+                    r['tag'] = "🟢底部启动+价格低位"
         results.sort(key=lambda x: (x['kind'] != 'bottom_start', -x['oi_calm_ratio']))
         return results
 
@@ -869,9 +991,16 @@ class WarmupTracker:
             return ""
 
         def pos_str(r):
-            if r.get('year_pos') is None:
-                return "位:?"
-            return f"位:{r['year_pos'] * 100:.0f}%" + ("🟢低位" if r['is_cheap'] else "")
+            parts = []
+            if r.get('oi_pos') is not None:
+                parts.append(f"杠杆位:{r['oi_pos'] * 100:.0f}%"
+                             + ("🟢" if r.get('is_oi_low') else ""))
+            else:
+                parts.append("杠杆位:?")
+            if r.get('year_pos') is not None:
+                parts.append(f"价位:{r['year_pos'] * 100:.0f}%"
+                             + ("🟢" if r.get('is_cheap') else ""))
+            return " ".join(parts)
 
         def line(r, extra=""):
             s = (f"• `{r['symbol']}`: {pos_str(r)} | OI累计{r['oi_change']:+.1f}%"
@@ -903,7 +1032,7 @@ class WarmupTracker:
         return "\n".join(parts).rstrip()
 
     def oi_sustained_growth_scan(self, all_metrics: List[Dict], monitor=None) -> str:
-        """存储每日快照 → 检测 OI 缓慢累积 → 补 LS/一年分位 → 生成消息片段"""
+        """存储每日快照 → 检测 OI 缓慢累积 → 补 OI分位/一年分位/LS → 生成消息片段"""
         self.store_daily_snapshot(all_metrics)
         snapshots = self.get_history()
         results = self.detect_oi_sustained_growth(snapshots)
