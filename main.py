@@ -502,7 +502,11 @@ class OIMonitor:
         all_metrics = [collected[t['symbol']] for t in active_tickers if t['symbol'] in collected]
 
         # 筛选逻辑
-        # 低位埋伏: 价格未暴涨(-2%到5%), OI增加(24h窗口), 大户多
+        # 横盘+大户多（原名「低位埋伏」，2026-09-14 改名）：
+        #   价格未暴涨(-2%到5%) + OI增加(24h窗口) + 大户多。
+        # **改名原因**：本判定式里没有杠杆位条件，栏名带「低位」会与「低位区」混淆——
+        # 实测会出现杠杆位 95~98% 的标的，与报告底部「杠杆位≥90% 不属于低位」自相矛盾。
+        # 现在「低位」一词只归「低位区」（杠杆位 ≤25%）专用。
         # OI 判定已从 2h 改为 24h：回测显示 2h 脉冲单独看是负 alpha（详见 get_real_oi_growth）
         accumulation = [d for d in all_metrics if -2 < d['price_chg'] < 5 and d['oi_chg_1d'] > 1.5 and d['ls'] > 1.2]
         top_oi = sorted(all_metrics, key=lambda x: x['oi_chg'], reverse=True)[:5]
@@ -510,7 +514,7 @@ class OIMonitor:
         ext_pos = sorted([d for d in all_metrics if d['funding'] > 0], key=lambda x: x['funding'], reverse=True)[:3]
 
         # ---- 两个位置：只给候选币补算，避免 ~300 次额外请求 ----
-        # 候选池 = 低位埋伏 + OI爆增 + 「OI 24h 累积且价格平静」的形状
+        # 候选池 = 横盘+大户多 + OI爆增 + 「OI 24h 累积且价格平静」的形状
         quiet = [d for d in all_metrics
                  if d['oi_chg_1d'] > self.OI_GROWTH_MIN
                  and abs(d['price_chg']) <= self.FLAT_PRICE_PCT]
@@ -593,7 +597,7 @@ class OIMonitor:
                     f"| OI:24h {d['oi_chg_1d']:+.1f}% (2h {d['oi_chg']:+.1f}%) "
                     f"| 价:{d['price_chg']:+.1f}%\n")
 
-        msg += "\n💎 **低位埋伏 (横盘+OI 24h增+大户多)**\n"
+        msg += "\n💎 **横盘 + 大户多 (OI 24h增>1.5% + LS>1.2 + 涨跌 −2%~+5%)**\n"
         if not accumulation: msg += "• 暂无匹配\n"
         for d in accumulation:
             msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:24h {d['oi_chg_1d']:+.1f}% | LS:{d['ls']:.2f}\n"
@@ -618,8 +622,12 @@ class OIMonitor:
         if high_leverage:
             # 措辞已按复检结果收紧：高分位那档实测并不差（+2.38%），
             # 所以只说"不是低位"，不再宣称它会被罚。
-            msg += (f"📉 杠杆位≥90% 的标的有 {len(high_leverage)} 个，"
-                    "它们的杠杆已经堆在近期高位，不属于「低位埋伏」的形状\n")
+            # 2026-09-14 两处修正：
+            #   ① 该计数只覆盖「算过杠杆位的候选币」（oi_pos 只对候选币补算，其余为 None），
+            #      不是全市场 —— 原措辞读起来像全市场，已改明。
+            #   ② 原写「低位埋伏」在本次改名后不存在了，此处应指「低位区」口径。
+            msg += (f"📉 本次算过杠杆位的候选币中，有 {len(high_leverage)} 个 ≥90%；"
+                    "杠杆已堆在近期高位，不属于「低位区（杠杆位≤25%）」的形状\n")
 
         return {
             "message": msg,
