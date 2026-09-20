@@ -41,6 +41,7 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
+        GSHEET_CREDENTIALS: ${{ secrets.GSHEET_CREDENTIALS }}
         PYTHONUNBUFFERED: "1"
       run: |
         python main.py report

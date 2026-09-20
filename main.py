@@ -633,6 +633,13 @@ class OIMonitor:
             "message": msg,
             "all_metrics": all_metrics,
             "low_zone": [d['symbol'] for d in low_zone],
+            # 低位区的结构化明细：只留落表需要的字段，供 ledger_writer 追加写入账本
+            "low_zone_rows": [
+                {k: d.get(k) for k in (
+                    "symbol", "price", "price_chg", "oi_chg_1d",
+                    "oi_pos", "is_oi_low", "year_pos", "is_cheap")}
+                for d in low_zone
+            ],
             "timestamp": datetime.now().isoformat()
         }
 
@@ -991,6 +998,19 @@ def main():
         scan_result = monitor.scan_and_collect(threshold=10_000_000)
         monitor.send_telegram(scan_result['message'])
         logger.info("OI 报告发送成功")
+
+        # ★ 把「低位区」信号追加写入 Google Sheet 账本。
+        #   只写前 10 列，结果列（24h/48h/7d）留空，由本机每日 10:30 的回填任务补。
+        #   整段包在 try 里：写表失败绝不影响 Telegram 报告。
+        try:
+            from ledger_writer import write_low_zone
+            n_rows, detail = write_low_zone(
+                scan_result.get('low_zone_rows'),
+                all_metrics=scan_result.get('all_metrics'),
+            )
+            logger.info(f"[ledger] {detail}")
+        except Exception as e:
+            logger.error(f"[ledger] 写入失败 {type(e).__name__}: {e}")
 
 
     except Exception as e:
