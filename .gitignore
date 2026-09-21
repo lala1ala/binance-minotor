@@ -1,4 +1,4 @@
 __pycache__/
 *.pyc
 _backfill_out/
-_dryrun.log
+_dryrun*.log

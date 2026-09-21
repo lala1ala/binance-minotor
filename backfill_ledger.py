@@ -34,7 +34,16 @@ FAPI = "https://fapi.binance.com"
 SPOT = "https://api.binance.com"
 HOUR_MS = 3600 * 1000
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-SYM_RE = re.compile(r"^[A-Z0-9]{2,15}$")
+# ★ 币种代号长度放宽到 1：币安确实有单字符代号（如 M/MemeCore 的 MUSDT）。
+#   原先 {2,15} 把 r441 的 M 当成异常行跳过，导致它永远回填不到。
+#   放宽后靠 KNOWN_DIRTY_ROWS 显式挡住错位行，而不是靠长度「凑巧」拦截。
+SYM_RE = re.compile(r"^[A-Z0-9]{1,15}$")
+
+# 已知永久脏行（列错位 / 代号被截断，原始信息无法还原，需人工修表）。
+# 2026-09-21 逐行核对确认：r331/r332/r401 的日期是正常的（2026-08-30 等），
+# 只有代号被截成单字符 O/4/T —— 若仅放宽长度，它们会被误收并填上错误数据
+# （T→TUSDT 是真实存在的 Threshold 交易对）。所以必须显式排除。
+KNOWN_DIRTY_ROWS = {66, 71, 80, 82, 93, 327, 331, 332, 365, 366, 372, 401}
 
 SHEET_ID_LEDGER = "1HBE_HXUgm7Sj0FJknDWO8hBi1OH3zNPJhWVBMiRV25w"
 SCOPE = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -304,11 +313,14 @@ def main():
     print("表 %s: 表头 %d 列, 数据 %d 行" % (args.tab, ncol, len(body)))
 
     # 解析行。日期列存在脏前缀（实测 '663 2026-08-21'），用正则把日期捞出来
-    recs, skipped = [], []
+    recs, skipped, dirty = [], [], []
     for i, r in enumerate(body):
         sheet_row = i + 2  # 1-based，含表头
         raw_date = str(r[0] or "")
         token = str(r[1] or "").strip()
+        if sheet_row in KNOWN_DIRTY_ROWS:
+            dirty.append(sheet_row)
+            continue
         m = re.search(r"(\d{4}-\d{2}-\d{2})", raw_date)
         if not m or not SYM_RE.match(token):
             skipped.append((sheet_row, raw_date, token))
@@ -321,9 +333,10 @@ def main():
             "row": sheet_row, "date": d, "token": token,
             "cells": {k: r[v] for k, v in COLS.items()},
         })
-    print("可解析 %d 行；跳过 %d 行（日期/币种异常）" % (len(recs), len(skipped)))
+    print("可解析 %d 行；已知脏行 %d 行（显式跳过）；格式异常 %d 行"
+          % (len(recs), len(dirty), len(skipped)))
     if skipped:
-        print("  跳过示例: %s" % (skipped[:6],))
+        print("  异常示例: %s" % (skipped[:6],))
 
     dates = sorted({x["date"] for x in recs})
     print("日期范围 %s ~ %s" % (dates[0], dates[-1]))
