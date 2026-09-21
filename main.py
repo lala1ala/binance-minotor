@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
+import tradfi_filter
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -454,6 +455,16 @@ class OIMonitor:
         logger.info(f"并发采集结束：{len(results)}/{total} 成功，耗时 {time.monotonic() - started:.1f}s")
         return results
 
+    def tradfi_exclusions(self):
+        """要被排除的传统资产（股票上链/商品/外汇/盘前）合约集合。
+
+        判据与实现见 tradfi_filter 模块：在线读币安 exchangeInfo 的 TradFi 标签，
+        取数失败时退到静态兜底清单。模块级缓存，一次运行只取一次。
+        """
+        if getattr(self, "_tradfi_excl", None) is None:
+            self._tradfi_excl = tradfi_filter.excluded_symbols(self.request_with_retry)
+        return self._tradfi_excl
+
     def scan_and_collect(self, threshold: float = 10_000_000) -> Dict:
         """扫描市场并返回结构化数据和报告文本"""
         logger.info("开始币安OI扫描...")
@@ -481,10 +492,17 @@ class OIMonitor:
 
         premiums = {p['symbol']: p for p in p_resp}
 
+        # 排除传统资产（股票上链/商品/外汇/盘前）：用户不关注股票，且它们成交额大，
+        # 不排除会常年挤进各榜单、并写进账本污染样本。
+        skip = self.tradfi_exclusions()
+        if skip:
+            logger.info("已排除传统资产合约 %d 个（股票/商品/外汇/盘前）", len(skip))
+
         # 筛选USDT活跃交易对：24h成交额 > $10M（约150个，覆盖主要活跃合约）
         active_tickers = [
             t for t in t_resp
             if t['symbol'].endswith("USDT") and float(t['quoteVolume']) > threshold
+            and t['symbol'] not in skip
         ]
         active_tickers.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
 
@@ -655,9 +673,13 @@ class OIMonitor:
 
         premiums = {p['symbol']: p for p in p_resp} if isinstance(p_resp, list) else {}
 
+        # 同 report 模式：传统资产一并排除
+        skip = self.tradfi_exclusions()
+
         active_tickers = [
             t for t in t_resp
             if t['symbol'].endswith("USDT") and float(t['quoteVolume']) > threshold
+            and t['symbol'] not in skip
         ]
         active_tickers.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
 
