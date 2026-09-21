@@ -1,0 +1,56 @@
+name: Backfill Signal Ledger
+
+# 把「自动任务信号回测」的结果列（24h/48h/7d 价格、涨跌%、vs BTC 超额）补齐。
+# 搬到云端的理由：原来跑在本机 WorkBuddy 的定时任务里，脚本写死了本机路径
+# （venv、skill 目录、APPDATA、凭证文件），换一台电脑就失效。
+# 现在与 radar 同一个仓库、同一套代理通道，完全不依赖任何本机环境。
+
+on:
+  schedule:
+    # 每天 02:30 UTC = 北京时间 10:30
+    - cron: '30 2 * * *'
+  workflow_dispatch: # 允许手动触发
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill-ledger
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    # 首次拉全量 K 线约 10 分钟；命中增量缓存后约 1 分钟。45 分钟是安全上限。
+    timeout-minutes: 45
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    # K 线缓存：历史 1h 线不会变，只补拉新增时段即可，
+    # 否则每天都要重新拉几百个币、耗时且更容易被限流。
+    - name: Restore klines cache
+      uses: actions/cache@v4
+      with:
+        path: _backfill_out/klines_cache.json
+        key: klines-${{ github.run_id }}
+        restore-keys: |
+          klines-
+
+    - name: Run backfill
+      env:
+        GSHEET_CREDENTIALS: ${{ secrets.GSHEET_CREDENTIALS }}
+        PYTHONUNBUFFERED: "1"
+      run: |
+        python backfill_ledger.py --write
