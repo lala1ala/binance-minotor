@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from tradfi_filter import excluded_symbols as non_crypto_symbols
 
@@ -142,6 +142,45 @@ def _seen_index(existing):
         if d0 and t0:
             idx[(d0, t0)] = i
     return idx
+
+
+def read_marks(now=None):
+    """只读账本，供推送时给低位区那些币打「重复标注」。
+
+    返回 (date_str, today_counts, prev_symbols)
+      today_counts : {TOKEN: 今天账本里已经记到的「扫描确认次数」}
+      prev_symbols : 昨天出现在账本里的 TOKEN 集合
+
+    为什么要有它：推送发生在落表之前（推送不该被写表拖住，写表失败也不该
+    影响推送）。所以推送时看不到「本次是今天第几次」——只能先读一遍现状，
+    再推算出「本次确认后 = 第 n+1 次」。这里的 n 与 write_low_zone 累加 X 列
+    的口径完全一致。
+
+    只读，不写任何单元格。失败会抛异常，由调用方决定是否降级为无标注。
+    """
+    now = now or datetime.now(timezone.utc)
+    date_str = now.strftime("%Y-%m-%d")
+    prev_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    wks = _sheet()
+    existing = wks.get_all_values()
+
+    today_counts: dict = {}
+    prev_symbols: set = set()
+    for r in existing[1:]:
+        if len(r) < 2:
+            continue
+        d0 = str(r[0])[:10]
+        t0 = str(r[1]).strip().upper()
+        if not t0:
+            continue
+        if d0 == date_str:
+            cur = str(r[X_COL]).strip() if len(r) > X_COL else ""
+            n = int(cur) if cur.isdigit() else 0
+            today_counts[t0] = max(today_counts.get(t0, 0), n)
+        elif d0 == prev_str:
+            prev_symbols.add(t0)
+    return date_str, today_counts, prev_symbols
 
 
 def _ensure_header(wks, existing):

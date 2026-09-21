@@ -17,6 +17,30 @@ import tradfi_filter
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# ==================== 低位区「重复标注」 ====================
+def low_zone_mark(sym: str, ledger_state) -> str:
+    """低位区那栏的重复标注，回答「这个币今天是第几次被扫到」。
+
+    ledger_state = (today_counts, prev_symbols)，来自 ledger_writer.read_marks()：
+      today_counts  {TOKEN: 今天账本里已记到的确认次数}
+      prev_symbols  昨天出现在账本里的 TOKEN 集合
+
+    口径：本次确认后 = 今日第 (已记次数 + 1) 次，与 write_low_zone 累加 X 列一致。
+      ⭐新  今日首现，且昨天不在榜
+      📌续  今日首现，但昨天也在榜（黏在榜上，不是新冒出来的）
+      🔁×N  今日第 N 次（N≥2）
+    传 None（读表失败）时返回空串，即不打标注。
+    """
+    if ledger_state is None:
+        return ""
+    counts, prev_syms = ledger_state
+    tok = sym[:-4] if sym.endswith("USDT") else sym
+    n = counts.get(tok, 0) + 1
+    if n == 1:
+        return " 📌续" if tok in prev_syms else " ⭐新"
+    return f" 🔁×{n}"
+
+
 # ==================== 配置 ====================
 class Config:
     def __init__(self):
@@ -465,8 +489,15 @@ class OIMonitor:
             self._tradfi_excl = tradfi_filter.excluded_symbols(self.request_with_retry)
         return self._tradfi_excl
 
-    def scan_and_collect(self, threshold: float = 10_000_000) -> Dict:
-        """扫描市场并返回结构化数据和报告文本"""
+    def scan_and_collect(self, threshold: float = 10_000_000, ledger_state=None) -> Dict:
+        """扫描市场并返回结构化数据和报告文本
+
+        ledger_state: 可选，(today_counts, prev_symbols)
+          today_counts  {TOKEN: 今天账本里已记到的扫描确认次数}
+          prev_symbols  昨天出现在账本里的 TOKEN 集合
+        只为给「低位区」栏打重复标注用（⭐新 / 📌续 / 🔁×N）。
+        传 None 或读表失败时不打标注，其余行为完全不变。
+        """
         logger.info("开始币安OI扫描...")
         # 获取Ticker和Funding
         t_resp = self.request_with_retry("https://fapi.binance.com/fapi/v1/ticker/24hr")
@@ -606,14 +637,23 @@ class OIMonitor:
 
         # ① 最符合口味的一栏放在最前面：杠杆低位 + OI 累积 + 价格平静
         # 标题里的窗口必须写准（原为含糊的「OI静默累积」，实际用的是 2h 变化 ── 已修）
+        # 「重复标注」口径：本次确认后，它是今天第几次被 2h 扫描扫到。
+        # = 账本里今天的次数 + 1（与 write_low_zone 累加 X 列完全一致）。
+        # 顺便区分「昨天也在榜」——那说明这币是黏在榜上，不是新冒出来的。
         msg += f"\n🟢 **低位区·OI日级累积 (杠杆位≤25% + OI 24h增>{self.OI_GROWTH_MIN:.0f}% + |24h涨跌|≤{self.FLAT_PRICE_PCT:.0f}%)**\n"
         if not low_zone:
             msg += "• 暂无匹配\n"
+        marked = False
         for d in low_zone[:8]:
+            mk = low_zone_mark(d['symbol'], ledger_state)
+            marked = marked or bool(mk)
             dd = f" | DD{d['year_dd']:+.0f}%" if d.get('year_dd') is not None else ""
-            msg += (f"• `{d['symbol']}`: {pos_tag(d)}{dd} "
+            msg += (f"• `{d['symbol']}`{mk}: {pos_tag(d)}{dd} "
                     f"| OI:24h {d['oi_chg_1d']:+.1f}% (2h {d['oi_chg']:+.1f}%) "
                     f"| 价:{d['price_chg']:+.1f}%\n")
+        if marked:
+            msg += ("   ⭐新=今日首现 ｜ 📌续=昨天也在榜 ｜ 🔁×N=今日第N次"
+                    "（重复≠加分，看 OI 增幅/价格涨幅的配比）\n")
 
         msg += "\n💎 **横盘 + 大户多 (OI 24h增>1.5% + LS>1.2 + 涨跌 −2%~+5%)**\n"
         if not accumulation: msg += "• 暂无匹配\n"
@@ -1017,13 +1057,26 @@ def main():
             return
 
         # 报告模式：全指标扫描 >$10M 池子
-        scan_result = monitor.scan_and_collect(threshold=10_000_000)
+        # 先「只读」一遍账本，拿到①今天已记到的确认次数 ②昨天在榜的币，
+        # 供低位区打重复标注（⭐新 / 📌续 / 🔁×N）。推送在前、落表在后，
+        # 所以推送时得先看现状再推算。读失败只是没标注，不影响扫描与推送。
+        ledger_state = None
+        try:
+            from ledger_writer import read_marks
+            _, today_counts, prev_syms = read_marks()
+            ledger_state = (today_counts, prev_syms)
+            logger.info(f"[ledger] 标注用状态：今日已记录 {len(today_counts)} 个，"
+                        f"昨日在榜 {len(prev_syms)} 个")
+        except Exception as e:
+            logger.warning(f"[ledger] 读账本失败，本次不打重复标注: {type(e).__name__}: {e}")
+
+        scan_result = monitor.scan_and_collect(threshold=10_000_000, ledger_state=ledger_state)
         monitor.send_telegram(scan_result['message'])
         logger.info("OI 报告发送成功")
 
         # ★ 把「低位区」信号追加写入 Google Sheet 账本。
-        #   只写前 10 列，结果列（24h/48h/7d）留空，由本机每日 10:30 的回填任务补。
-        #   整段包在 try 里：写表失败绝不影响 Telegram 报告。
+        #   只写前 10 列 + X 列「扫描确认次数」，结果列（24h/48h/7d）留空，
+        #   由云端每日回填任务补。整段包在 try 里：写表失败绝不影响 Telegram 报告。
         try:
             from ledger_writer import write_low_zone
             n_rows, detail = write_low_zone(
