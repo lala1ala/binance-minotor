@@ -59,6 +59,18 @@ HORIZONS = (("24", 24, ("p24", "r24", "br24", "brp24", "v24")),
             ("48", 48, ("p48", "r48", "brp48", "v48")),
             ("7d", 168, ("p7d", "r7d", "brp7d", "v7d")))
 
+# 位置列（0-indexed）：Y=24「DD(距1年高点%)」、Z=25「价位分位%」
+# radar（ledger_writer）正常会自己写这两列；本脚本只补它没写上的行
+# （例如当时 get_year_position 请求失败留下 N/A）。
+# 口径必须与 main.get_year_position 一致：高低点只取**已收盘**的 365 根日线，
+# 当前价用本行「入场价」。
+POS_COLS = {"dd": 24, "pos": 25}
+DAILY_LIMIT = 366          # 365 根已完成 + 当天那根（要剔除）
+DAY_MS = 86400 * 1000
+POS_MIN_BARS = 60
+DAILY_CACHE = "daily_cache.json"
+_PX_RE = re.compile(r"([0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)")
+
 
 # ==================== 网络层：直连 → 代理降级 ====================
 class Net:
@@ -257,6 +269,71 @@ def fmt_pct(v):
     return "%+.2f%%" % v if v is not None else None
 
 
+def parse_price(cell):
+    """「入场价」列可能是 '$1.23' / 'N/A' / '0.00000496'，统一转 float。
+
+    N/A 是历史遗留（08-18 那 5 行）与 radar 取不到价时的写法，视为缺失。
+    """
+    if cell is None:
+        return None
+    t = str(cell).replace(",", "").replace("$", "").strip()
+    if t in ("", "-", "N/A", "nan", "None"):
+        return None
+    m = _PX_RE.search(t)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
+def fetch_daily(sym, market, cached=None):
+    """最近 366 根日线，返回 {openTime_ms: (high, low)}。
+
+    历史日线不会变 → 命中缓存直接整包返回（与 1h 缓存不同，这里不需要增量补拉：
+    回看窗口是「信号日往前 365 天」，新增的信号行最多只多要几根，而缓存是
+    「截至今天」的 366 根，对任何历史信号日都已覆盖）。
+
+    ★ 只在缓存为空时才请求，且失败返回空 dict（调用方按「日线不足」处理）。
+    """
+    if cached:
+        try:
+            return {int(k): tuple(v) for k, v in cached.items()}
+        except Exception:  # noqa: BLE001
+            return {}
+    base = FAPI if market == "fapi" else SPOT
+    path = "/fapi/v1/klines" if market == "fapi" else "/api/v3/klines"
+    d = http_json("%s%s?symbol=%s&interval=1d&limit=%d"
+                  % (base, path, sym, DAILY_LIMIT), timeout=60)
+    out = {}
+    if isinstance(d, list):
+        for k in d:
+            out[int(k[0])] = (float(k[2]), float(k[3]))
+    return out
+
+
+def year_position(daily, anchor_ms, entry_px):
+    """用**已收盘**的 365 根日线算 (DD%, 价位分位%)，口径同 main.get_year_position。
+
+    窗口 = [信号日 - 365 天, 信号日)，即剔除信号当天那根（当日盘中最高若算进
+    「一年高点」，等于引入当日未来信息，回填时无法复现）。
+    """
+    if entry_px is None or not daily or entry_px <= 0:
+        return None
+    a_day = anchor_ms // DAY_MS
+    prior = [v for ts, v in daily.items() if a_day - 365 <= ts // DAY_MS < a_day]
+    if len(prior) < POS_MIN_BARS:
+        return None
+    hi = max(v[0] for v in prior)
+    lo = min(v[1] for v in prior)
+    if hi <= lo:
+        return None
+    return ((entry_px / hi - 1.0) * 100.0,
+            (entry_px - lo) / (hi - lo) * 100.0)
+
+
 # ==================== Google Sheet ====================
 def _credentials():
     """凭证优先级：环境变量 GSHEET_CREDENTIALS（云端） → 本地文件（本机调试）。"""
@@ -332,6 +409,9 @@ def main():
         recs.append({
             "row": sheet_row, "date": d, "token": token,
             "cells": {k: r[v] for k, v in COLS.items()},
+            "entry": parse_price(r[8] if len(r) > 8 else ""),
+            "pos_cells": {k: (r[v] if len(r) > v else "")
+                          for k, v in POS_COLS.items()},
         })
     print("可解析 %d 行；已知脏行 %d 行（显式跳过）；格式异常 %d 行"
           % (len(recs), len(dirty), len(skipped)))
@@ -457,6 +537,74 @@ def main():
             stats["filled"] += len(rowset)
         else:
             stats["already"] += 1
+
+    # ---- 位置列（Y/Z）补齐 ----
+    # radar 已自带这两列（ledger_writer 写 year_dd / year_pos），这里只补它没写上的
+    # 行。整段包 try：这条路失败绝不影响结果列回填这个主业。
+    try:
+        need = [x for x in recs
+                if x["entry"] is not None
+                and not all(str(x["pos_cells"].get(k) or "").strip()
+                            for k in POS_COLS)]
+        print("")
+        print("位置列（DD/价位分位）待补 %d 行" % len(need))
+        if need:
+            dpath = os.path.join(args.out, DAILY_CACHE)
+            dcache = {}
+            if os.path.exists(dpath):
+                try:
+                    with open(dpath, "r", encoding="utf-8") as f:
+                        dcache = json.load(f)
+                    print("  命中日线缓存 %d 个币" % len(dcache))
+                except Exception:  # noqa: BLE001
+                    dcache = {}
+
+            dsym, seen_sym = {}, set()
+            with ThreadPoolExecutor(max_workers=args.workers) as ex:
+                futs = {}
+                for x in need:
+                    r = resolved.get(x["token"])
+                    if not r or x["token"] in seen_sym:
+                        continue
+                    seen_sym.add(x["token"])
+                    futs[ex.submit(fetch_daily, r[0], r[1],
+                                   dcache.get(x["token"]))] = x["token"]
+                for fut in as_completed(futs):
+                    t = futs[fut]
+                    try:
+                        dsym[t] = fut.result()
+                    except Exception:  # noqa: BLE001
+                        dsym[t] = {}
+                    dcache[t] = {str(k): list(v) for k, v in dsym[t].items()}
+            try:
+                with open(dpath, "w", encoding="utf-8") as f:
+                    json.dump(dcache, f)
+                print("  日线缓存已写 %s（%d 币）" % (dpath, len(dcache)))
+            except Exception as e:  # noqa: BLE001
+                print("  [warn] 日线缓存写入失败: %s" % e)
+
+            by_row = {u["row"]: u for u in updates}
+            pos_filled = pos_nodata = 0
+            for x in need:
+                anchor = int(datetime.strptime(x["date"], "%Y-%m-%d")
+                             .replace(tzinfo=timezone.utc).timestamp() * 1000)
+                yp = year_position(dsym.get(x["token"]) or {}, anchor, x["entry"])
+                if not yp:
+                    pos_nodata += 1
+                    continue
+                u = by_row.get(x["row"])
+                if u is None:
+                    u = {"row": x["row"], "date": x["date"], "token": x["token"],
+                         "cells": {}, "_orig": {}}
+                    by_row[x["row"]] = u
+                    updates.append(u)
+                for k, v in zip(("dd", "pos"), yp):
+                    if not str(x["pos_cells"].get(k) or "").strip():
+                        u["cells"][POS_COLS[k]] = round(v, 1)
+                        pos_filled += 1
+            print("  位置列补 %d 个单元格；日线不足 %d 行" % (pos_filled, pos_nodata))
+    except Exception as e:  # noqa: BLE001
+        print("  [warn] 位置列补齐失败（不影响结果列）: %s" % e)
 
     updates_path = os.path.join(args.out, "updates.json")
     with open(updates_path, "w", encoding="utf-8") as f:
