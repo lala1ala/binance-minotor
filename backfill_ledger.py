@@ -27,6 +27,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from urllib.parse import quote as urlquote
 
 import requests
 
@@ -70,6 +71,119 @@ DAY_MS = 86400 * 1000
 POS_MIN_BARS = 60
 DAILY_CACHE = "daily_cache.json"
 _PX_RE = re.compile(r"([0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)")
+
+# ---- 协议收入列（AA/AB，2026-09-22 新增）----
+# 口径：只收录「Token 与协议一一对应、且 DefiLlama 口径明确」的条目。
+# 组合型协议按子 slug 相加；Revenue 优先，只有 Fees 的标 ⚠️Fees。
+# L1 链级费用标 ⚠️链级费用（与协议收入不是一个概念，不可直接横向比）。
+# ★ 明确不做自动按 ticker 匹配 —— 实测会产生大量同名假项目（ASTER→Aster USDF、
+#   ZEN→Zena Finance、NIL→Nileriver、GAS→Gas404Swap 等）。
+REV_COLS = {"rev": 26, "src": 27}
+REV_MAP = {
+    # 收入表已核验映射（12 周 0.00% 复现，见 defillama-weekly-revenue skill）
+    "PUMP":   ("Pump.fun", ["pump.fun"], "rev"),
+    "CAKE":   ("PancakeSwap", ["pancakeswap-amm", "pancakeswap-amm-v3",
+                               "pancakeswap-stableswap"], "rev"),
+    "MET":    ("Meteora", ["meteora-damm-v1", "meteora-dlmm"], "rev"),
+    "LDO":    ("Lido", ["lido"], "rev"),
+    "AERO":   ("Aerodrome", ["aerodrome"], "rev"),
+    "ETHFI":  ("ether.fi", ["ether.fi-stake", "ether.fi-liquid"], "rev"),
+    "AAVE":   ("Aave", ["aave-v2", "aave-v3"], "rev"),
+    "HYPE":   ("Hyperliquid", ["hyperliquid-perps"], "rev"),
+    "UNI":    ("Uniswap", ["uniswap"], "rev"),
+    "LIT":    ("Lighter ⚠️Fees", ["lighter"], "fee"),
+    "MORPHO": ("Morpho ⚠️Fees", ["morpho-blue", "morpho-midnight"], "fee"),
+    # 人工确认同项目
+    "ENA":    ("Ethena", ["ethena-usde"], "rev"),
+    "COMP":   ("Compound", ["compound-v3"], "rev"),
+    "PENDLE": ("Pendle", ["pendle-v2"], "rev"),
+    "CVX":    ("Convex Finance", ["convex-finance"], "rev"),
+    "FLUID":  ("Fluid", ["fluid-lending"], "rev"),
+    "SPK":    ("Spark", ["sparklend"], "rev"),
+    "VIRTUAL": ("Virtuals Protocol", ["virtuals-protocol"], "rev"),
+    "MON":    ("Monad", ["monad"], "rev"),
+    "ARB":    ("Arbitrum", ["arbitrum-nitro"], "rev"),
+    "ZRO":    ("LayerZero", ["layerzero-v2"], "rev"),
+    "FIL":    ("Filecoin", ["filecoin"], "rev"),
+    "RENDER": ("Render", ["render-network-bme"], "rev"),
+    "LISTA":  ("Lista DAO", ["lista-lending"], "rev"),
+    "ZK":     ("zkSync Era", ["zksync-era"], "rev"),
+    "EDGE":   ("edgeX", ["edgex"], "rev"),
+    "TWT":    ("Trust Wallet", ["trust-wallet-perps"], "rev"),
+    "WLFI":   ("World Liberty Financial", ["world-liberty-financial"], "rev"),
+    "ENS":    ("ENS", ["ens"], "rev"),
+    # L1 链级费用
+    "BTC":    ("Bitcoin ⚠️链级费用", ["bitcoin"], "fee"),
+    "SOL":    ("Solana ⚠️链级费用", ["solana"], "fee"),
+    "TRX":    ("Tron ⚠️链级费用", ["tron"], "rev"),
+}
+# 有意不收录（口径不唯一或数据明显缺口），改动前先核：
+#   LINK — 拆为 chainlink-staking/requests 等碎片；PYTH — pyth-pro/core/entropy 碎片；
+#   AVAX/ADA/MOVE — 30D 分别仅 $0.16M/$8.8K/$5，疑为覆盖缺口
+LLAMA_SUMMARY = "https://api.llama.fi/summary/fees/"
+REV_CACHE = "rev_cache.json"
+REV_WINDOW = 30
+
+
+def rev_dtype(kind):
+    return "dailyRevenue" if kind == "rev" else "dailyFees"
+
+
+def fetch_rev_series(need, cached=None):
+    """逐 slug 拉日收入/费用序列，返回 {"slug|dataType": [[ts, val], ...]}。
+
+    ★ 不许改用 /overview/fees 的 total30d —— 那是**当前** 30 天，写进历史行就是前视。
+      实测：09-22 的快照里 HYPE 30D = 58.1M，若用它填 08-21 那一行会填出同一个数，
+      而 08-21 的窗口（07-23~08-21）内 Hyperliquid 日收入只有 1M 量级。
+      必须按「行日期往前 30 天」算窗口，与手工回填的 140 行保持同一口径。
+    序列一次拉全历史，缓存后次日只补新增（新 slug 才会重新请求）。
+    """
+    cache = dict(cached or {})
+    todo = sorted(k for k in need if k not in cache)
+    print("  DefiLlama 日序列：待拉 %d 个 / 缓存命中 %d 个"
+          % (len(todo), len(cache)))
+    for i, key in enumerate(todo, 1):
+        slug, dt = key.split("|", 1)
+        try:
+            d = http_json(LLAMA_SUMMARY + urlquote(slug) + "?dataType=" + dt,
+                          timeout=60)
+            cache[key] = (d or {}).get("totalDataChart") or []
+        except Exception as e:  # noqa: BLE001
+            cache[key] = []
+            print("    [%d/%d] %s %s 失败: %s" % (i, len(todo), slug, dt, e))
+        if i % 10 == 0 or i == len(todo):
+            print("    %d/%d" % (i, len(todo)))
+    return cache
+
+
+def rev30_at(token, row_date, series):
+    """该行日期往前 30 天（含当日）的收入合计 → (金额, 显示名) / (None, None)。
+
+    组合型协议 = 各子 slug 逐日相加后再求和。无映射、无数据、窗口内全空 → None。
+    """
+    m = REV_MAP.get(str(token).strip())
+    if not m:
+        return None, None
+    label, slugs, kind = m
+    dt = rev_dtype(kind)
+    try:
+        end = int(datetime.strptime(str(row_date).strip(), "%Y-%m-%d")
+                  .replace(tzinfo=timezone.utc).timestamp())
+    except Exception:  # noqa: BLE001
+        return None, None
+    start = end - (REV_WINDOW - 1) * 86400
+    total, got = 0.0, False
+    for s in slugs:
+        for pt in (series.get(s + "|" + dt) or []):
+            if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                continue
+            ts, v = pt[0], pt[1]
+            if v is None:
+                continue
+            if start <= ts <= end:
+                total += float(v)
+                got = True
+    return (round(total, 2), label) if got else (None, None)
 
 
 # ==================== 网络层：直连 → 代理降级 ====================
@@ -412,6 +526,8 @@ def main():
             "entry": parse_price(r[8] if len(r) > 8 else ""),
             "pos_cells": {k: (r[v] if len(r) > v else "")
                           for k, v in POS_COLS.items()},
+            "rev_cells": {k: (r[v] if len(r) > v else "")
+                          for k, v in REV_COLS.items()},
         })
     print("可解析 %d 行；已知脏行 %d 行（显式跳过）；格式异常 %d 行"
           % (len(recs), len(dirty), len(skipped)))
@@ -605,6 +721,66 @@ def main():
             print("  位置列补 %d 个单元格；日线不足 %d 行" % (pos_filled, pos_nodata))
     except Exception as e:  # noqa: BLE001
         print("  [warn] 位置列补齐失败（不影响结果列）: %s" % e)
+
+    # ---- 协议收入列（AA/AB）补齐 ----
+    # 只有「Token 在策展映射里」且「该行 AA/AB 仍为空」时才写。整段包 try。
+    try:
+        todo = [x for x in recs
+                if not str(x["rev_cells"].get("src") or "").strip()]
+        print("")
+        print("收入列待补 %d 行（映射内 %d 个 Token）"
+              % (len(todo), len(REV_MAP)))
+        if todo:
+            # 只拉「本批 todo 会用到的」slug，并按行日期算窗口（避免前视）
+            need_keys = set()
+            for x in todo:
+                m = REV_MAP.get(str(x["token"]).strip())
+                if not m:
+                    continue
+                for s in m[1]:
+                    need_keys.add(s + "|" + rev_dtype(m[2]))
+
+            rpath = os.path.join(args.out, REV_CACHE)
+            rcache = {}
+            if os.path.exists(rpath):
+                try:
+                    with open(rpath, "r", encoding="utf-8") as f:
+                        rcache = json.load(f) or {}
+                except Exception:  # noqa: BLE001
+                    rcache = {}
+            rseries = fetch_rev_series(sorted(need_keys), cached=rcache)
+            try:
+                with open(rpath, "w", encoding="utf-8") as f:
+                    json.dump(rseries, f)
+                print("  收入序列缓存已写 %s（%d 个 slug）" % (rpath, len(rseries)))
+            except Exception as e:  # noqa: BLE001
+                print("  [warn] 收入序列缓存写入失败: %s" % e)
+
+            by_row2 = {u["row"]: u for u in updates}
+            rev_filled = rev_nomap = 0
+            for x in todo:
+                try:
+                    val, label = rev30_at(x["token"], x["date"], rseries)
+                except Exception:  # noqa: BLE001
+                    val, label = None, None
+                if val is None:
+                    rev_nomap += 1
+                    continue
+                u = by_row2.get(x["row"])
+                if u is None:
+                    u = {"row": x["row"], "date": x["date"], "token": x["token"],
+                         "cells": {}, "_orig": {}}
+                    by_row2[x["row"]] = u
+                    updates.append(u)
+                if not str(x["rev_cells"].get("rev") or "").strip():
+                    u["cells"][REV_COLS["rev"]] = val
+                if not str(x["rev_cells"].get("src") or "").strip():
+                    u["cells"][REV_COLS["src"]] = label
+                rev_filled += 1
+            print("  收入列补 %d 行；映射外/无数据 %d 行"
+                  % (rev_filled, rev_nomap))
+    except Exception as e:  # noqa: BLE001
+        print("  [warn] 收入列补齐失败（不影响结果列）: %s" % e)
 
     updates_path = os.path.join(args.out, "updates.json")
     with open(updates_path, "w", encoding="utf-8") as f:
