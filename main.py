@@ -273,15 +273,23 @@ class OIMonitor:
             pos      0~1，越小越便宜
             dd       距一年高点的回撤%（负数）
             low365 / high365 / days / is_cheap
+
+        ★ 2026-09-22 口径修正：高/低点只取**已收盘**的 365 根日线（剔除今天这根
+          未收盘的），当前价仍取最新价。原因两条：
+            ① 若把今天的盘中最高算进「一年高点」，就等于引入当日未来信息，
+               回填历史时无法复现（同一天早上算和晚上算结果不一样）；
+            ② 账本 Y 列「DD(距1年高点%)」按同一口径回填的，两边必须一致。
+          影响面：只有「正在创新高」的币会变（原来的 dd 略偏负），其余不变。
         """
         try:
             url = (f"https://fapi.binance.com/fapi/v1/klines"
-                   f"?symbol={symbol}&interval=1d&limit={self.YEAR_LOOKBACK_DAYS}")
+                   f"?symbol={symbol}&interval=1d&limit={self.YEAR_LOOKBACK_DAYS + 1}")
             resp = self.request_with_retry(url)
-            if not isinstance(resp, list) or len(resp) < self.YEAR_MIN_BARS:
+            if not isinstance(resp, list) or len(resp) < self.YEAR_MIN_BARS + 1:
                 return None
-            highs = [float(k[2]) for k in resp]
-            lows = [float(k[3]) for k in resp]
+            prior = resp[:-1]                    # 剔除当天这根未收盘的
+            highs = [float(k[2]) for k in prior]
+            lows = [float(k[3]) for k in prior]
             close = float(resp[-1][4])
             hi, lo = max(highs), min(lows)
             if hi <= lo or close <= 0:
@@ -292,7 +300,7 @@ class OIMonitor:
                 "dd": (close - hi) / hi * 100,
                 "low365": lo,
                 "high365": hi,
-                "days": len(resp),
+                "days": len(prior),
                 "is_cheap": pos <= self.YEAR_LOW_POS_MAX,
             }
         except Exception as e:
@@ -692,10 +700,14 @@ class OIMonitor:
             "all_metrics": all_metrics,
             "low_zone": [d['symbol'] for d in low_zone],
             # 低位区的结构化明细：只留落表需要的字段，供 ledger_writer 追加写入账本
+            # ★ 2026-09-22 加入 year_dd：原先只送了 year_pos / is_cheap，
+            #   「距一年高点回撤」在源头就被丢掉，导致账本里只有「杠杆贵不贵」
+            #   没有「价格贵不贵」。两项都算好了（get_year_position 同一次返回），
+            #   白名单漏一个字段就白算一趟。
             "low_zone_rows": [
                 {k: d.get(k) for k in (
                     "symbol", "price", "price_chg", "oi_chg_1d",
-                    "oi_pos", "is_oi_low", "year_pos", "is_cheap")}
+                    "oi_pos", "is_oi_low", "year_pos", "year_dd", "is_cheap")}
                 for d in low_zone
             ],
             "timestamp": datetime.now().isoformat()
@@ -1075,8 +1087,9 @@ def main():
         logger.info("OI 报告发送成功")
 
         # ★ 把「低位区」信号追加写入 Google Sheet 账本。
-        #   只写前 10 列 + X 列「扫描确认次数」，结果列（24h/48h/7d）留空，
-        #   由云端每日回填任务补。整段包在 try 里：写表失败绝不影响 Telegram 报告。
+        #   只写前 10 列 + X「扫描确认次数」+ Y「DD(距1年高点%)」+ Z「价位分位%」，
+        #   结果列（24h/48h/7d）留空，由云端每日回填任务补。
+        #   整段包在 try 里：写表失败绝不影响 Telegram 报告。
         try:
             from ledger_writer import write_low_zone
             n_rows, detail = write_low_zone(

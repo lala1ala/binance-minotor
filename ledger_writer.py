@@ -4,12 +4,23 @@
 
 职责边界（很重要，别越界）
   - 只写「信号行」的前 10 列：日期 / Token / 信号来源 / OI分位 / OI变化% /
-    Price变化% / 方向感知 / 共振确认 / 入场价 / BTC入场价，另加 X 列「扫描确认次数」
+    Price变化% / 方向感知 / 共振确认 / 入场价 / BTC入场价，
+    另加 X「扫描确认次数」、Y「DD(距1年高点%)」、Z「价位分位%」
   - **结果列（10~22：24h/48h/7d 价格与 vs BTC 超额）一律留空**，
     由 GitHub Actions 的每日回填任务（backfill_ledger.py）计算补上
   - 同一天同一个币只记第一条（当天重复触发不重复记账）；当天再次命中时
     只把 X 列「扫描确认次数」+1 —— 这一个数就是「该币当天被 2h 扫描确认了几次」
   - X 列是唯一会被更新的列，其余既有单元格一概不动
+
+★ 2026-09-22 新增 Y/Z 两列「位置」维度
+    背景：这张表原先只有「杠杆贵不贵」（OI分位），没有「价格贵不贵」。
+    radar 其实一直在算（get_year_position 同时返回 pos 和 dd），
+    而且 DD 早就推到 Telegram 了，但落表时被丢在两处：
+      ① main.py 的 low_zone_rows 字段白名单没有 year_dd（源头丢）
+      ② 本文件 build_rows 只写了 oi_pos，连传过来的 year_pos 也没写（第二道丢）
+    现在两道都补上。口径与 main.py 的 get_year_position 完全一致
+    （高点取**已收盘**的 365 根日线，剔除当天未收盘那根）。
+    Y/Z 写成**数字**（不是带 % 的文本），方便排序与统计。
 
 凭证：环境变量 GSHEET_CREDENTIALS（service account JSON 的完整文本）
 
@@ -28,9 +39,13 @@ from tradfi_filter import excluded_symbols as non_crypto_symbols
 
 SHEET_ID = "1HBE_HXUgm7Sj0FJknDWO8hBi1OH3zNPJhWVBMiRV25w"
 TAB = "自动任务信号回测"
-NCOL = 24          # 23 个既有列 + X 列「扫描确认次数」
+NCOL = 26          # 23 个既有列 + X「扫描确认次数」 + Y/Z 两列位置
 X_COL = 23         # X 列的 0-based 下标
+Y_COL = 24         # DD(距1年高点%)
+Z_COL = 25         # 价位分位%
 HDR_X = "扫描确认次数"
+HDR_Y = "DD(距1年高点%)"
+HDR_Z = "价位分位%"
 SRC = "低位区"
 
 FAPI = "https://fapi.binance.com"
@@ -80,7 +95,7 @@ def _btc_price(all_metrics=None):
 
 
 def build_rows(low_zone_rows, all_metrics=None, now=None):
-    """把 low_zone 的原始 dict 列表转成 23 列的表格行"""
+    """把 low_zone 的原始 dict 列表转成 26 列的表格行"""
     now = now or datetime.now(timezone.utc)
     date_str = now.strftime("%Y-%m-%d")
     btc_px = _btc_price(all_metrics)
@@ -111,6 +126,10 @@ def build_rows(low_zone_rows, all_metrics=None, now=None):
         row[8] = _fmt_price(d.get("price"))
         row[9] = _fmt_price(btc_px)
         row[X_COL] = "1"          # 首次确认；当天再次命中时由 write_low_zone 累加
+        # Y/Z：位置两维。写数字不写文本，方便排序与统计。
+        ydd, ypos = d.get("year_dd"), d.get("year_pos")
+        row[Y_COL] = round(float(ydd), 1) if ydd is not None else "N/A"
+        row[Z_COL] = round(float(ypos) * 100, 1) if ypos is not None else "N/A"
         # row[10:23] 留空 —— 结果列由每日回填任务补
         rows.append(row)
     return date_str, rows
@@ -184,14 +203,23 @@ def read_marks(now=None):
 
 
 def _ensure_header(wks, existing):
-    """确保 X 列表头存在（首次运行时写一次）"""
+    """确保 X / Y / Z 列表头存在（缺哪个补哪个，一次批更新）"""
+    import gspread
+
     head = existing[0] if existing else []
-    if len(head) > X_COL and str(head[X_COL]).strip():
+    want = ((X_COL, HDR_X), (Y_COL, HDR_Y), (Z_COL, HDR_Z))
+    ops = []
+    for col, name in want:
+        if len(head) > col and str(head[col]).strip():
+            continue
+        ops.append({"range": gspread.utils.rowcol_to_a1(1, col + 1),
+                    "values": [[name]]})
+    if not ops:
         return
     try:
-        wks.update_cell(1, X_COL + 1, HDR_X)
+        wks.batch_update(ops, value_input_option="RAW")
     except Exception as e:  # noqa: BLE001
-        print(f"  [warn] X 列表头写入失败: {e}")
+        print(f"  [warn] 表头写入失败: {e}")
 
 
 def write_low_zone(low_zone_rows, all_metrics=None):
