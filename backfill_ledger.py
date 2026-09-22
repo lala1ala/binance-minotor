@@ -559,6 +559,21 @@ def main():
     print("  可解析 %d / %d；无法解析 %d: %s"
           % (len(resolved), len(need), len(unresolved), unresolved))
 
+    # ★★ 币安 API 全失败时必须**显式报错退出**，不许静默成功。
+    #   2026-09-22 15:00 实测过一次：runner 上直连 + 50 个代理全败 →
+    #   resolved 为空 → 结果列一行都回填不了，但脚本照样走完并 exit 0，
+    #   Actions 显示绿色 success。这种静默失败比报错更危险 ——
+    #   它会被当成「今天已经回填过了」，实际什么都没做。
+    if need and not resolved:
+        print("")
+        print("!! 币安交易对解析 0 / %d —— 交易所 API 全失败（直连与代理都没通）。"
+              % len(need))
+        print("!! 本次没有回填任何结果列。这是**环境故障**，"
+              "不是「没有可回填的行」。")
+        print("!! 手动重跑：gh workflow run backfill.yml "
+              "--repo lala1ala/binance-minotor --ref main")
+        sys.exit(1)
+
     # 时间窗口：最早 D-1d，最晚 max(D)+8d
     t0 = int(datetime.strptime(dates[0], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000) - 24 * HOUR_MS
     t1 = int(datetime.strptime(dates[-1], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000) + 8 * 24 * HOUR_MS
