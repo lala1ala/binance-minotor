@@ -60,25 +60,26 @@ HORIZONS = (("24", 24, ("p24", "r24", "br24", "brp24", "v24")),
             ("48", 48, ("p48", "r48", "brp48", "v48")),
             ("7d", 168, ("p7d", "r7d", "brp7d", "v7d")))
 
-# 位置列（0-indexed）：Y=24「DD(距1年高点%)」、Z=25「价位分位%」
+# 位置列（0-indexed）：C=2「DD(距1年高点%)」、D=3「价位分位%」
+# ⚠️ 2026-09-23 表结构调整：这两列从表尾 Y/Z(24/25) 移到 Token 之后 → 2/3。
 # radar（ledger_writer）正常会自己写这两列；本脚本只补它没写上的行
 # （例如当时 get_year_position 请求失败留下 N/A）。
 # 口径必须与 main.get_year_position 一致：高低点只取**已收盘**的 365 根日线，
 # 当前价用本行「入场价」。
-POS_COLS = {"dd": 24, "pos": 25}
+POS_COLS = {"dd": 2, "pos": 3}
 DAILY_LIMIT = 366          # 365 根已完成 + 当天那根（要剔除）
 DAY_MS = 86400 * 1000
 POS_MIN_BARS = 60
 DAILY_CACHE = "daily_cache.json"
 _PX_RE = re.compile(r"([0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)")
 
-# ---- 协议收入列（AA/AB，2026-09-22 新增）----
+# ---- 协议收入列（2026-09-22 新增；2026-09-23 因删两列 26/27 → 24/25）----
 # 口径：只收录「Token 与协议一一对应、且 DefiLlama 口径明确」的条目。
 # 组合型协议按子 slug 相加；Revenue 优先，只有 Fees 的标 ⚠️Fees。
 # L1 链级费用标 ⚠️链级费用（与协议收入不是一个概念，不可直接横向比）。
 # ★ 明确不做自动按 ticker 匹配 —— 实测会产生大量同名假项目（ASTER→Aster USDF、
 #   ZEN→Zena Finance、NIL→Nileriver、GAS→Gas404Swap 等）。
-REV_COLS = {"rev": 26, "src": 27}
+REV_COLS = {"rev": 24, "src": 25}
 REV_MAP = {
     # 收入表已核验映射（12 周 0.00% 复现，见 defillama-weekly-revenue skill）
     "PUMP":   ("Pump.fun", ["pump.fun"], "rev"),
@@ -669,7 +670,7 @@ def main():
         else:
             stats["already"] += 1
 
-    # ---- 位置列（Y/Z）补齐 ----
+    # ---- 位置列（C/D）补齐 ----
     # radar 已自带这两列（ledger_writer 写 year_dd / year_pos），这里只补它没写上的
     # 行。整段包 try：这条路失败绝不影响结果列回填这个主业。
     try:
@@ -737,8 +738,8 @@ def main():
     except Exception as e:  # noqa: BLE001
         print("  [warn] 位置列补齐失败（不影响结果列）: %s" % e)
 
-    # ---- 协议收入列（AA/AB）补齐 ----
-    # 只有「Token 在策展映射里」且「该行 AA/AB 仍为空」时才写。整段包 try。
+    # ---- 协议收入列（Y/Z，列名在表头）补齐 ----
+    # 只有「Token 在策展映射里」且「该行收入两列仍为空」时才写。整段包 try。
     try:
         todo = [x for x in recs
                 if not str(x["rev_cells"].get("src") or "").strip()]
