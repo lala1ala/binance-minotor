@@ -2,8 +2,9 @@ name: Dead Letter Alert
 
 on:
   schedule:
-    # 每 2 小时错开 30 分钟跑一次（monitor 是整点，告警检查半点，避免和它抢）
-    - cron: '30 */2 * * *'
+    # 每 2 小时的第 37 分钟跑一次（monitor 在 :07，告警在 :37，错开 30 分钟避免互相抢）。
+    # 同时避开 :00 和 :30 —— 这两个是 GitHub 官方点名的高峰分钟，最容易被延迟或丢弃。
+    - cron: '37 */2 * * *'
   workflow_dispatch:
 
 permissions:
@@ -33,6 +34,9 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEADLETTER_WINDOW_HOURS: "6"
+          # 阈值 9h 的依据：radar 被 GitHub 丢调度后，实测"正常"空窗中位数约 6h、
+          # 最长约 8.94h。原值 6h 会让告警在正常节奏下就反复误报（昨天/今天各响一次）。
+          # 9h = 刚好覆盖已知最长正常空窗，同时真停机仍能在 9 小时内被发现。
+          DEADLETTER_WINDOW_HOURS: "9"
           PYTHONUNBUFFERED: "1"
         run: python deadletter.py
