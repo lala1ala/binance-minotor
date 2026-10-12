@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import random
 import logging
 import threading
 import requests
@@ -68,7 +69,9 @@ class OIMonitor:
     # 原实现最坏情况：5s 直连 + 10 个代理 × 5s = 55s / 请求，乘以约 600 次请求 ≈ 9 小时
     DIRECT_TIMEOUT = 8         # 直连超时（秒）
     PROXY_TIMEOUT = 6          # 单个代理超时（秒）
-    MAX_PROXY_RETRIES = 3      # 单请求最多试几个代理（原来是 10）
+    MAX_PROXY_RETRIES = 8      # 单请求最多试几个代理（2026-10-12 由 3 改 8：
+                               # 实测 monosans 池健康率约 25%，3 个全挂概率 42%；
+                               # 8 个全挂降到 10%。找到 1 个活代理后整个扫描复用它）
     MAX_WORKERS = 8            # 并发取数线程数
     SCAN_BUDGET_SECONDS = 600  # 单次扫描总时间预算（10 分钟），到点就用已有数据出报告
     TELEGRAM_MAX_LEN = 4000    # Telegram 单条消息上限，超出自动分片
@@ -118,8 +121,13 @@ class OIMonitor:
             url = "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
             resp = requests.get(url, timeout=5)
             if resp.status_code == 200:
-                # 只取前50个，避免太久
-                all_proxies = resp.text.splitlines()[:50]
+                # 2026-10-12 修复：该列表按 IP 段排序（连续多行属同一集群）。
+                # 原来只取前 50 个 = 押注列表头部的一两个小集群；实测连续两天
+                # 头部 85.8.47.x 集群整体死亡 → 每班必挂。改为从全列表随机抽样，
+                # 保证候选分散在不同网段。
+                lines_all = [l.strip() for l in resp.text.splitlines() if l.strip() and ":" in l]
+                n = min(60, len(lines_all))
+                all_proxies = random.sample(lines_all, n) if n else []
                 with self._lock:
                     self.proxies = [{"http": f"http://{p}", "https": f"http://{p}"} for p in all_proxies]
                 logger.info(f"成功获取 {len(all_proxies)} 个代理")
