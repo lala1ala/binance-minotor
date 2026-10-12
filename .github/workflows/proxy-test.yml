@@ -1,0 +1,82 @@
+name: Proxy Test (one-off)
+
+on:
+  workflow_dispatch: # 仅手动触发，用于诊断代理通道
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install requests
+      run: pip install requests
+    - name: Test proxies against Binance fapi
+      run: |
+        cat > /tmp/proxytest.py <<'PYEOF'
+        import concurrent.futures, requests, random, time
+        from collections import Counter
+
+        FAPI = "https://fapi.binance.com/fapi/v1/time"
+        SPOT = "https://data-api.binance.vision/api/v3/time"
+
+        # 1. 直连测试（生产视角的关键事实）
+        for name, u in [("fapi直连", FAPI), ("spot-vision直连", SPOT)]:
+            try:
+                r = requests.get(u, timeout=8)
+                print(f"[DIRECT] {name}: HTTP {r.status_code} | body={r.text[:120]!r}")
+            except Exception as e:
+                print(f"[DIRECT] {name}: EXC {type(e).__name__} {e}")
+
+        # 2. 抓三个免费代理源
+        sources = {
+            "monosans": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+            "proxyscrape": "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=6000",
+            "proxifly": "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+        }
+        pools = {}
+        for name, url in sources.items():
+            try:
+                txt = requests.get(url, timeout=15).text
+                lines = [l.strip() for l in txt.splitlines()
+                         if l.strip() and ":" in l and not l.startswith("#")]
+                pools[name] = lines
+                print(f"[POOL] {name}: {len(lines)} 个")
+            except Exception as e:
+                print(f"[POOL] {name}: 抓取失败 {e}")
+
+        def test(px):
+            try:
+                r = requests.get(FAPI, proxies={"http": f"http://{px}", "https": f"http://{px}"},
+                                 timeout=6)
+                if r.status_code == 200 and "serverTime" in r.text:
+                    return ("OK", px, None)
+                return (f"HTTP{r.status_code}", px, r.text[:80])
+            except Exception as e:
+                return ("FAIL", px, type(e).__name__)
+
+        # 3. 每个源抽 250 个并发实测
+        random.seed(2026)
+        winners = []
+        for name, pool in pools.items():
+            if not pool:
+                continue
+            sample = pool if len(pool) <= 250 else random.sample(pool, 250)
+            t0 = time.time()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=40) as ex:
+                res = list(ex.map(test, sample))
+            ok = [r for r in res if r[0] == "OK"]
+            dist = Counter(r[0] for r in res)
+            print(f"[RESULT] {name}: 抽测 {len(sample)} → 成功 {len(ok)} | 分布 {dict(dist)} | 耗时 {time.time()-t0:.0f}s")
+            for r in ok[:10]:
+                print(f"   [WINNER] {r[1]}")
+                winners.append(r[1])
+
+        print(f"[SUMMARY] 可用代理总数: {len(winners)}")
+        PYEOF
+        python /tmp/proxytest.py
