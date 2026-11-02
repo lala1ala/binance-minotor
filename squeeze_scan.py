@@ -7,7 +7,7 @@
 
 落成机器判据（2026-11-02 定，含两处实测修正）：
   · 币安 USDT 永续，status=TRADING（天然排除已下架/待下架）
-  · 上市 7~90 天（exchangeInfo.onboardDate）
+  · 上市 7~180 天（exchangeInfo.onboardDate）
   · 距「上市以来最高价」回撤 ≤ −60%（新币没有一年历史，用上市以来高点）
   · OI 名义额 ≤ $1,500 万（**替代市值做粗筛**，因为 rada 没有市值源；
     这只是代理指标，不是市值本身）
@@ -37,7 +37,10 @@ logger = logging.getLogger(__name__)
 FAPI = "https://fapi.binance.com"
 
 MIN_LIST_DAYS = 7
-MAX_LIST_DAYS = 90
+# 2026-11-02 用户决定：90 → 180 天。
+# 原因：7~90 天窗口内当时只有 7 个加密永续，且全部正费率，这条监控会长期不出声；
+# 90~180 天池子里还有 14 个币。放宽只影响「候选多少」，不改判据本身。
+MAX_LIST_DAYS = 180
 MIN_DD = -60.0            # 距上市以来高点回撤上限（负数）
 MAX_OI_USD = 15_000_000   # OI 名义额上限
 MAX_FUNDING = 0.0         # 当前费率必须 ≤ 0
@@ -240,7 +243,7 @@ def format_message(rows):
         )
     lines.append("")
     lines.append(
-        "口径：上市 7–90 天 · 距上市以来高点 ≤−60% · OI ≤$1,500万 · "
+        f"口径：上市 {MIN_LIST_DAYS}–{MAX_LIST_DAYS} 天 · 距上市以来高点 ≤−60% · OI ≤$1,500万 · "
         "费率≤0 · 换手 1.5–15（OI 是市值代理，不是市值本身）"
     )
     lines.append("同一币只推首次；来源 daidaibtc 2025-02-25 的做空条件")
