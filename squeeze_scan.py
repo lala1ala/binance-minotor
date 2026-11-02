@@ -138,6 +138,7 @@ def scan(monitor, deadline=None):
     tick_map = {x["symbol"]: x for x in tick if x.get("symbol")}
 
     cands = []
+    n_new = 0
     for s in info["symbols"]:
         sym = s.get("symbol") or ""
         if not sym.endswith("USDT") or sym in excluded:
@@ -150,6 +151,7 @@ def scan(monitor, deadline=None):
         days = (now_ms - float(onboard)) / 86400000.0
         if not (MIN_LIST_DAYS <= days <= MAX_LIST_DAYS):
             continue
+        n_new += 1
         t = tick_map.get(sym)
         if not t:
             continue
@@ -164,7 +166,8 @@ def scan(monitor, deadline=None):
         cands.append((sym, days, qv, fp))
 
     logger.info(
-        f"[squeeze] 上市 {MIN_LIST_DAYS}~{MAX_LIST_DAYS} 天的 USDT 永续共 {len(cands)} 个"
+        f"[squeeze] 上市 {MIN_LIST_DAYS}~{MAX_LIST_DAYS} 天的加密永续 {n_new} 个，"
+        f"其中成交额>={MIN_QUOTE_VOL/1e4:.0f}万且费率<=0 的 {len(cands)} 个"
         f"（已排除传统资产 {len(excluded)} 个）"
     )
     if not cands:
