@@ -214,11 +214,15 @@ def build_digest(rows, pool_n, first_seen=None, now=None):
             "这是取数问题，不是「没信号」。"
         )
 
+    # ⚠️ 达到 TOP_N 说明候选被截断，真实负费率币可能更多，不能写成确数
+    if pool_n >= TOP_N:
+        scope = f"负费率合约 ≥{pool_n} 个（已达单轮上限，实际可能更多）"
+    else:
+        scope = f"负费率合约 {pool_n} 个"
     lines = [
         head,
         "",
-        f"负费率合约 {pool_n} 个 → 连续≥{MIN_NEG_HOURS:.0f}h 且价位≤{MAX_POS*100:.0f}% "
-        f"的 {len(rows)} 个",
+        f"{scope} → 连续≥{MIN_NEG_HOURS:.0f}h 且价位≤{MAX_POS*100:.0f}% 的 {len(rows)} 个",
     ]
     if not rows:
         lines += [
@@ -279,7 +283,10 @@ def run(monitor, notify=False):
 
     if notify:
         try:
-            monitor.send_telegram(build_digest(rows, pool_n, first_seen))
+            text = build_digest(rows, pool_n, first_seen)
+            # 把原文打进日志：报告只发 Telegram，出了问题否则无从对照
+            logger.info("[funding] 日报原文:\n" + text)
+            monitor.send_telegram(text)
             logger.info("[funding] 日报已发送")
         except Exception as e:  # noqa: BLE001
             logger.error(f"[funding] 日报发送失败: {e}")
