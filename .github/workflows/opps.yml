@@ -21,7 +21,10 @@ concurrency:
 jobs:
   run-opps:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 两个扫描串行：squeeze 预算 300s + funding 预算 420s，
+    # 加上 pip install 与收尾，给 20 分钟上限。
+    # （2026-11-02 实测：代理慢时 funding 单靠 150s 只跑完 12/59 个币）
+    timeout-minutes: 20
 
     steps:
     - name: Checkout code

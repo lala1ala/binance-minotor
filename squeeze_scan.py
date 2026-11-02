@@ -46,12 +46,29 @@ TURNOVER_MAX = 15.0
 MIN_QUOTE_VOL = 300_000
 MIN_BARS = 20             # 少于 20 根日线不下结论
 MAX_CANDIDATES = 80
-BUDGET_SECONDS = 150
+BUDGET_SECONDS = 300
 MAX_PUSH = 5
 
 
+def _get_json(monitor, url, timeout=20, tries=3):
+    """整体关键请求（exchangeInfo/ticker/premiumIndex）失败时重试。
+
+    2026-11-02 实测：GHA runner 直连币安必挂，全靠公共代理；代理抖动时
+    request_with_retry 会返回 None，若不重试整轮扫描直接归零，
+    而且日志只有一行 ERROR，看起来像「没有信号」。这里补 2 次重试。
+    """
+    for i in range(tries):
+        r = monitor.request_with_retry(url, timeout=timeout)
+        if r is not None:
+            return r
+        if i + 1 < tries:
+            logger.warning(f"[squeeze] {url.split('/')[-1]} 第 {i + 1} 次取数失败，重试")
+            time.sleep(2)
+    return None
+
+
 def _exchange_info(monitor):
-    info = monitor.request_with_retry(f"{FAPI}/fapi/v1/exchangeInfo", timeout=20)
+    info = _get_json(monitor, f"{FAPI}/fapi/v1/exchangeInfo", timeout=20)
     if not isinstance(info, dict) or not info.get("symbols"):
         logger.error("[squeeze] exchangeInfo 取数失败")
         return None
@@ -129,8 +146,8 @@ def scan(monitor, deadline=None):
         return []
     excluded = _tradfi_from_info(info)
 
-    tick = monitor.request_with_retry(f"{FAPI}/fapi/v1/ticker/24hr", timeout=20)
-    prem = monitor.request_with_retry(f"{FAPI}/fapi/v1/premiumIndex", timeout=15)
+    tick = _get_json(monitor, f"{FAPI}/fapi/v1/ticker/24hr", timeout=20)
+    prem = _get_json(monitor, f"{FAPI}/fapi/v1/premiumIndex", timeout=15)
     if not isinstance(tick, list) or not isinstance(prem, list):
         logger.error("[squeeze] ticker/premiumIndex 取数失败")
         return []
@@ -175,7 +192,7 @@ def scan(monitor, deadline=None):
     cands = cands[:MAX_CANDIDATES]
 
     results = []
-    pool = ThreadPoolExecutor(max_workers=6)
+    pool = ThreadPoolExecutor(max_workers=8)
     try:
         futs = {
             pool.submit(_candidate, monitor, sym, days, qv, fp): sym

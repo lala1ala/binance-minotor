@@ -44,7 +44,10 @@ FAPI = "https://fapi.binance.com"
 MIN_NEG_HOURS = 72.0      # 连续负费率最低时长（按小时，不按「期数」）
 MAX_POS = 0.20            # 一年低点分位上限（0=最低）
 TOP_N = 60                # 最多查多少个「当前费率最负」的币（控请求量）
-BUDGET_SECONDS = 150      # 本模块自己的时间预算，超了就用手上的数据收工
+BUDGET_SECONDS = 420      # 本模块自己的时间预算。2026-11-02 实测：代理慢时
+                          # 150s 只跑完 12/59 个，命中从 4 个掉到 1 个 —— 结果不可复现。
+                          # 单请求最坏 48s（直连 3×8s + 代理 4×6s），
+                          # 59 个 / 10 并发 × 48s ≈ 283s，420s 有足够余量。
 
 
 def _neg_streak(hist, now_ts):
@@ -85,7 +88,14 @@ def _neg_streak(hist, now_ts):
 
 def _fetch_neg_pool(monitor):
     """当前费率为负的 USDT 合约，按费率从最负到最不负排序。"""
-    resp = monitor.request_with_retry(f"{FAPI}/fapi/v1/premiumIndex")
+    resp = None
+    for i in range(3):
+        resp = monitor.request_with_retry(f"{FAPI}/fapi/v1/premiumIndex", timeout=15)
+        if isinstance(resp, list):
+            break
+        if i < 2:
+            logger.warning(f"[funding] premiumIndex 第 {i + 1} 次取数失败，重试")
+            time.sleep(2)
     if not isinstance(resp, list):
         logger.error("[funding] premiumIndex 取数失败")
         return []
@@ -109,6 +119,12 @@ def _candidate(monitor, symbol, now_ts, cur_rate):
     hist = monitor.request_with_retry(
         f"{FAPI}/fapi/v1/fundingRate?symbol={symbol}&limit=500", timeout=12
     )
+    if not isinstance(hist, list) or not hist:
+        # 代理抖动下重试一次：一个币漏掉会让「本轮命中数」随网络波动，
+        # 看起来像信号时有时无。
+        hist = monitor.request_with_retry(
+            f"{FAPI}/fapi/v1/fundingRate?symbol={symbol}&limit=500", timeout=12
+        )
     if not isinstance(hist, list) or not hist:
         return None
 
@@ -146,7 +162,7 @@ def scan(monitor, deadline=None):
         return []
 
     results = {}
-    pool_exec = ThreadPoolExecutor(max_workers=6)
+    pool_exec = ThreadPoolExecutor(max_workers=10)
     try:
         futs = {
             pool_exec.submit(_candidate, monitor, sym, now_ts, rate): sym
