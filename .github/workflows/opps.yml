@@ -1,0 +1,48 @@
+name: Opps Scan (funding-lowzone + smallcap squeeze)
+
+# 为什么单独一个 workflow：
+#   main.py report 那条链路（monitor.yml）已经有 600s 扫描预算 + 账本写入，
+#   再挂两个扫描会撞 20 分钟 timeout，把主推送拖挂。
+#   这里独立跑、独立超时，失败不影响 radar 的 Telegram 日报。
+
+on:
+  schedule:
+    # 每 2 小时的第 37 分钟。主 radar 是第 7 分钟，错开 30 分钟避免同时打币安接口。
+    - cron: '37 */2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binance-opps
+  cancel-in-progress: false
+
+jobs:
+  run-opps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Run Opps Scan
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
+        GSHEET_CREDENTIALS: ${{ secrets.GSHEET_CREDENTIALS }}
+        PYTHONUNBUFFERED: "1"
+      run: |
+        python main.py opps

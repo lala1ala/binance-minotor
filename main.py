@@ -1076,6 +1076,29 @@ def main():
                 logger.info("本次无 OI 持续升温候选")
             return
 
+        if mode == 'opps':
+            # ①③ 两个新信号，独立入口 + 独立 workflow（opps.yml）。
+            # 为什么不塞进 report 模式：主扫描本身已有 600s 预算，加上账本写入
+            # 已经接近 workflow 的 20 分钟上限；再挂两个扫描会把主推送拖进 timeout。
+            # 这里每次调用都单独 try，一个失败不影响另一个，更不影响主推送。
+
+            # ③ 小市值爆空扫描（daidaibtc 2025-02-25）：首次命中才推
+            try:
+                from squeeze_scan import run as run_squeeze
+                n = run_squeeze(monitor)
+                logger.info(f"[opps] 爆空扫描完成，首次命中 {n} 个")
+            except Exception as e:
+                logger.error(f"[opps] 爆空扫描失败 {type(e).__name__}: {e}", exc_info=True)
+
+            # ① 负费率持续性 + 低位（daidaibtc 2025-03-31）：只记录、不推送
+            try:
+                from funding_lowzone import run as run_funding
+                n = run_funding(monitor)
+                logger.info(f"[opps] 负费率观察完成，记录 {n} 个")
+            except Exception as e:
+                logger.error(f"[opps] 负费率观察失败 {type(e).__name__}: {e}", exc_info=True)
+            return
+
         # 报告模式：全指标扫描 >$10M 池子
         # 先「只读」一遍账本，拿到①今天已记到的确认次数 ②昨天在榜的币，
         # 供低位区打重复标注（⭐新 / 📌续 / 🔁×N）。推送在前、落表在后，
