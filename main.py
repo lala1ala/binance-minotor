@@ -1090,11 +1090,17 @@ def main():
             except Exception as e:
                 logger.error(f"[opps] 爆空扫描失败 {type(e).__name__}: {e}", exc_info=True)
 
-            # ① 负费率持续性 + 低位（daidaibtc 2025-03-31）：只记录、不推送
+            # ① 负费率持续性 + 低位（daidaibtc 2025-03-31）
+            # 每 2 小时只写表；每天北京 09:00 那一轮（workflow 注入 OPPS_DIGEST=1）
+            # 额外发一条日报，0 命中也发 —— 用户要的是「知道它今天跑了没有」。
             try:
                 from funding_lowzone import run as run_funding
-                n = run_funding(monitor)
-                logger.info(f"[opps] 负费率观察完成，记录 {n} 个")
+                notify = os.getenv("OPPS_DIGEST", "0").strip() == "1"
+                n = run_funding(monitor, notify=notify)
+                logger.info(
+                    f"[opps] 负费率观察完成，记录 {n} 个"
+                    f"（{'日报轮' if notify else '仅记录'}）"
+                )
             except Exception as e:
                 logger.error(f"[opps] 负费率观察失败 {type(e).__name__}: {e}", exc_info=True)
             return

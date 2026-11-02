@@ -9,7 +9,15 @@ on:
   schedule:
     # 每 2 小时的第 37 分钟。主 radar 是第 7 分钟，错开 30 分钟避免同时打币安接口。
     - cron: '37 */2 * * *'
+    # 每天 UTC 01:07 = 北京 09:07，这一轮额外发「负费率低位」日报（0 命中也发）。
+    # 第 7 分钟是为了和主 radar 的 09:07 撞车时也只差几秒，不占两个整点。
+    - cron: '7 1 * * *'
   workflow_dispatch:
+    inputs:
+      digest:
+        description: '强制发一条负费率日报（测试用）'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -46,6 +54,9 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
         GSHEET_CREDENTIALS: ${{ secrets.GSHEET_CREDENTIALS }}
+        # 只有「每天 01:07 UTC」那一轮（或手动勾选 digest）才发负费率日报，
+        # 其余 2 小时轮次只写表 —— 否则同一批币每天会刷 12 次。
+        OPPS_DIGEST: ${{ (github.event.schedule == '7 1 * * *' || github.event.inputs.digest == 'true') && '1' || '0' }}
         PYTHONUNBUFFERED: "1"
       run: |
         python main.py opps

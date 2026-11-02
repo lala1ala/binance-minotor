@@ -20,9 +20,11 @@
      会把观察池清空；改为按累积费率排序，保证一直有 5~10 个对象。
   4) 24–72h 档 83 样本 −0.03% / 49.4%（等于随机），所以 72h 以下不记。
 
-⚠️ 第一版**只记录、不推送**（用户 2026-11-02 决定）：
-   结果写进 Google Sheet「爆空与负费率观察」，不在 Telegram 里出现。
-   等累积几天样本、确认有用之后再决定要不要进日报。
+推送节奏（2026-11-02 用户要求改，原方案「只记录不推送」已废弃）：
+  · 每 2 小时照旧写 Google Sheet「爆空与负费率观察」，**不推**（避免同一批币反复刷）。
+  · **每天北京时间 09:00 发一条日报**到 Telegram：本轮命中数 + 榜上前 8 名。
+  · **0 命中也发**。用户原话「我怎么知道呢 这个难道是为了跑而跑吗」——
+    不发声就等于无法区分「没信号」和「任务挂了」。日报同时是存活证明。
 
 局限（写清楚，别当成已验证结论）：
   · 回测只有 5.5 个月、单一下跌环境；
@@ -34,6 +36,7 @@ from __future__ import annotations
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import opps_writer
 
@@ -159,7 +162,7 @@ def scan(monitor, deadline=None):
     pool = _fetch_neg_pool(monitor)
     logger.info(f"[funding] 当前负费率合约 {len(pool)} 个进入候选（上限 {TOP_N}）")
     if not pool:
-        return []
+        return [], 0
 
     results = {}
     pool_exec = ThreadPoolExecutor(max_workers=10)
@@ -190,29 +193,96 @@ def scan(monitor, deadline=None):
         f"[funding] 连续负费率≥{MIN_NEG_HOURS:.0f}h 且价位≤{MAX_POS*100:.0f}% 的 "
         f"{len(rows)} 个（耗时 {time.monotonic() - started:.1f}s）"
     )
-    return rows
+    return rows, len(pool)
 
 
-def run(monitor):
-    """入口：扫描 → 写观察表。不推送 Telegram。"""
+def build_digest(rows, pool_n, first_seen=None, now=None):
+    """日报文案。纯函数，方便本地拿假数据验排版。
+
+    first_seen: {TOKEN: 最早出现日期 YYYY-MM-DD}，用于标 🆕。
+                取不到就传 {}，此时不标新进（宁可不标，也不乱标）。
+    """
+    first_seen = first_seen or {}
+    now = now or datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    head = f"📉 负费率低位 · 每日观察 {now.strftime('%m-%d')}"
+
+    if pool_n <= 0:
+        return (
+            head + "\n\n"
+            "⚠️ 负费率合约取数失败（或当前确实一个都没有），本轮没有扫描结果。\n"
+            "这是取数问题，不是「没信号」。"
+        )
+
+    lines = [
+        head,
+        "",
+        f"负费率合约 {pool_n} 个 → 连续≥{MIN_NEG_HOURS:.0f}h 且价位≤{MAX_POS*100:.0f}% "
+        f"的 {len(rows)} 个",
+    ]
+    if not rows:
+        lines += [
+            "",
+            "榜上是空的。这条每天都会发，空着说明任务在跑、只是今天没信号。",
+        ]
+        return "\n".join(lines)
+
+    lines.append("")
+    for i, r in enumerate(rows[:8], 1):
+        tok = r["token"]
+        is_new = first_seen.get(tok.upper()) in (None, today)
+        dd = "—" if r.get("dd") is None else f"{r['dd']:.1f}%"
+        hrs = f"{r['neg_hours']:.0f}h"
+        if r.get("truncated"):
+            hrs = "≥" + hrs
+        lines.append(
+            f"{i}. {tok} 累积 {r['cum_pct']:.2f}%｜{hrs}｜价位 {r['pos'] * 100:.1f}%｜DD {dd}"
+            + (" 🆕" if is_new else "")
+        )
+    if len(rows) > 8:
+        lines.append(f"…另有 {len(rows) - 8} 个，见表格")
+    lines += ["", "🆕 = 第一次进这张表 ｜ 只观察，不构成买入信号"]
+    return "\n".join(lines)
+
+
+def run(monitor, notify=False):
+    """入口：扫描 → 写观察表 → （仅日报轮）推送。
+
+    notify=True 只在每天北京 09:00 那一轮由 main.py 传入，
+    其余 2 小时轮次只写表不推，避免同一批币反复刷屏。
+    """
     started = time.monotonic()
-    rows = scan(monitor)
+    rows, pool_n = scan(monitor)
+
+    # ⚠️ 必须在上写入之前读历史，否则本轮刚写的行会把「🆕」抹掉
+    first_seen = {}
+    if notify and rows:
+        try:
+            first_seen = opps_writer.funding_first_seen()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[funding] 读历史失败，日报不标新进: {e}")
+
     if not rows:
         logger.info("[funding] 本轮无符合项，未写入")
-        return 0
-
-    sheet_rows = []
-    for r in rows:
-        note = "500期全负，时长是下界" if r["truncated"] else ""
-        sheet_rows.append(
-            opps_writer.funding_row(
-                r["token"], r["pos"], r["dd"], r["neg_hours"],
-                r["cum_pct"], r["cur_pct"], note,
+    else:
+        sheet_rows = []
+        for r in rows:
+            note = "500期全负，时长是下界" if r["truncated"] else ""
+            sheet_rows.append(
+                opps_writer.funding_row(
+                    r["token"], r["pos"], r["dd"], r["neg_hours"],
+                    r["cum_pct"], r["cur_pct"], note,
+                )
             )
-        )
-    n_new, n_upd = opps_writer.upsert(sheet_rows)
-    logger.info(
-        f"[funding] 观察表 写入 {n_new} 新行 / 更新 {n_upd} 行"
-        f"（总耗时 {time.monotonic() - started:.1f}s）"
-    )
+        n_new, n_upd = opps_writer.upsert(sheet_rows)
+        logger.info(f"[funding] 观察表 写入 {n_new} 新行 / 更新 {n_upd} 行")
+
+    if notify:
+        try:
+            monitor.send_telegram(build_digest(rows, pool_n, first_seen))
+            logger.info("[funding] 日报已发送")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[funding] 日报发送失败: {e}")
+
+    logger.info(f"[funding] 总耗时 {time.monotonic() - started:.1f}s")
     return len(rows)

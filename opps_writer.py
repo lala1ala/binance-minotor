@@ -84,6 +84,27 @@ def seen_tokens(kind=TYPE_SQUEEZE):
     return got
 
 
+def funding_first_seen():
+    """「负费率低位」里每个 Token 最早出现的日期（UTC，YYYY-MM-DD）。
+
+    日报用它标 🆕：表里没有过 → 新进；最早日期 == 今天 → 今天新进。
+    ⚠️ 必须在 upsert 之前调用，否则本轮刚写进去的行会让所有币都算「今天新进」。
+    """
+    out = {}
+    for _, r in read_rows():
+        if len(r) <= 2:
+            continue
+        if str(r[1]).strip() != TYPE_FUNDING:
+            continue
+        t = str(r[2]).strip().upper()
+        d = str(r[0])[:10]
+        if not t or not d:
+            continue
+        if t not in out or d < out[t]:
+            out[t] = d
+    return out
+
+
 def upsert(rows):
     """按 (日期, 类型, Token) 去重：已存在就整行覆盖，否则追加。
 
