@@ -31,6 +31,32 @@ const WORKFLOWS = {
   '52 */2 * * *': 'opps.yml',
 };
 
+/**
+ * 把 Cloudflare 回传的 cron 表达式规范化后再匹配。
+ *
+ * 为什么不能直接 WORKFLOWS[event.cron]：
+ *   dashboard 的可视化编辑器可能把 `... *\/6 ...` 展开成 `... 0,6,12,18 ...`，
+ *   或者表达式里多一个空格。一旦字符串不完全相等，精确匹配就会落空 ——
+ *   而落空的后果是「只打一行日志、什么都不触发」，从外面看就是「配好了但不动」。
+ *   这类静默失效最难查，所以这里做两层容错。
+ */
+function normalizeCron(expr) {
+  return String(expr || '').trim().split(/\s+/).join(' ');
+}
+
+function pickWorkflow(expr) {
+  const key = normalizeCron(expr);
+  if (WORKFLOWS[key]) return WORKFLOWS[key];
+
+  // 第一层容错：按「分」+「时」两个字段判断，忽略写法差异
+  const [minute, hour] = key.split(' ');
+  if (minute === '22' && ['*/6', '0,6,12,18'].includes(hour)) return 'monitor.yml';
+  if (minute === '52' && ['*/2', '0,2,4,6,8,10,12,14,16,18,20,22'].includes(hour)) {
+    return 'opps.yml';
+  }
+  return null;
+}
+
 async function dispatch(env, workflow) {
   const { OWNER: owner, REPO: repo, GH_TOKEN: token } = env;
   if (!owner || !repo || !token) {
@@ -80,10 +106,15 @@ async function dispatch(env, workflow) {
 export default {
   // Cron 触发入口
   async scheduled(event, env) {
-    const workflow = WORKFLOWS[event.cron];
-    if (!workflow) {
-      console.warn(`未知的 cron 表达式: ${event.cron}`);
-      return;
+    const mapped = pickWorkflow(event.cron);
+    // 实在认不出来也别静默丢掉：默认跑主报告，并把原始表达式打进日志，
+    // 这样即使表达式填错，也不会出现「配好了但永远不动」。
+    const workflow = mapped || 'monitor.yml';
+    if (!mapped) {
+      console.error(
+        `未知的 cron 表达式: "${event.cron}"（规范化后 "${normalizeCron(event.cron)}"）` +
+        `→ 兜底派发 ${workflow}，请检查 Cron Trigger 是否填成 22 */6 或 52 */2`
+      );
     }
     await dispatch(env, workflow);
   },
