@@ -4,6 +4,12 @@ on:
   schedule:
     # 每天 UTC 01:00（北京时间 09:00）跑一次升温快照
     - cron: '0 1 * * *'
+    # 补班 2 次（2026-11-03 新增）：GitHub schedule 是 best-effort，实测会丢班
+    # （11-03 当天一次都没跑；11-01/10-31 cancelled，10-29/10-30 failure）。
+    # 多排两个时间点提高命中率；重复执行由 main.py 的 last_warmup_date 闸挡掉，
+    # 当天已发过就直接 return，不会重复推送。
+    - cron: '0 2 * * *'
+    - cron: '0 3 * * *'
   workflow_dispatch:
 
 # 最小权限：只需要读取代码
@@ -36,5 +42,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
+          # 当天去重闸要用 opps_state 页记 last_warmup_date；没有这个凭证
+          # last_warmup_date() 会静默返回 None（闸门形同不存在），补班就会重复推送。
+          GSHEET_CREDENTIALS: ${{ secrets.GSHEET_CREDENTIALS }}
           PYTHONUNBUFFERED: "1"
         run: python main.py warmup
