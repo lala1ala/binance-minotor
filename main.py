@@ -1094,6 +1094,32 @@ def main():
         monitor = OIMonitor(config.bot_token, config.chat_id)
 
         if mode == 'warmup':
+            # ---- 幂等闸：当天已发过就跳过（2026-11-03 新增）----
+            # 为什么加在这里而不是复用下面 report 的闸门：warmup 分支自己 return，
+            # 根本走不到下面那道 90 分钟闸。而现在 Cloudflare 会在 '22 1 * * *'
+            # 额外兜底触发一次，不拦就是同一天两条一模一样的升温报告。
+            # FORCE_WARMUP=1 可强制重发（手动排查用）。
+            try:
+                from opps_writer import last_warmup_date, mark_warmup_sent
+            except Exception as e:  # noqa: BLE001
+                last_warmup_date = mark_warmup_sent = None
+                logger.warning(
+                    f"[warmup] 幂等状态模块不可用，本轮不设闸: {type(e).__name__}: {e}"
+                )
+
+            bj_day = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+            if last_warmup_date and os.getenv("FORCE_WARMUP", "").strip() != "1":
+                try:
+                    last_day = last_warmup_date()
+                    if last_day == bj_day:
+                        logger.info(
+                            f"[warmup] 今天（{bj_day}）已发过升温报告，本轮跳过"
+                            f"（强制重发请设 FORCE_WARMUP=1）"
+                        )
+                        return
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[warmup] 幂等闸异常，本轮照跑: {type(e).__name__}: {e}")
+
             # warmup 需要 Firebase 存快照；report 模式完全不碰 Firebase
             fb = FirebaseManager(config.firebase_creds_json)
             # 升温模式：轻扫 >$5M 池子，存快照并检测「OI 缓慢累积」
@@ -1106,6 +1132,12 @@ def main():
             if warmup_msg:
                 monitor.send_telegram(warmup_msg)
                 logger.info("OI 持续升温报告发送成功")
+                # 只有推送成功才记日期：推送抛异常就走不到这里 → 不记录 → 下一班能补发。
+                try:
+                    if mark_warmup_sent:
+                        mark_warmup_sent(bj_day)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[warmup] 记录发送日期失败: {type(e).__name__}: {e}")
             else:
                 logger.info("本次无 OI 持续升温候选")
             return

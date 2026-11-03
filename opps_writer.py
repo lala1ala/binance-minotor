@@ -261,6 +261,65 @@ def mark_report_sent(ts):
         return False
 
 
+# ---- 升温报告幂等：当天只发一次 ----
+# 为什么需要：warmup.yml 原本只有一条 '0 1 * * *'（UTC 01:00，北京 09:00），
+# GitHub schedule 丢班就一整天没有升温报告。2026-11-03 给 Cloudflare Worker
+# 加了第三条 Cron Trigger（'22 1 * * *'）兜底，于是同一天会有两次触发。
+# 而 warmup 分支在 main.py 里跑在 90 分钟闸门**之前**（该分支自己 return），
+# 那道闸管不到它，所以必须在这里单独拦一道，否则会推两条一模一样的报告。
+# 与日报、主报告复用同一张 opps_state 页，只是 key 不同。
+STATE_KEY_WARMUP_DATE = "last_warmup_date"
+
+
+def _state_get(key):
+    """读状态页某个 key 的原始字符串值。
+
+    三态，调用方必须区分：
+      · 非空字符串 → 上次记录值
+      · ""         → 状态页正常但没有该 key（首次上线）
+      · None       → **读失败**。调用方应继续跑：宁可重复一次，不可漏推。
+    """
+    try:
+        vals = _get_state_sheet().get_all_values()
+    except Exception as e:  # noqa: BLE001
+        print(f"[opps_state] 读 {key} 失败: {type(e).__name__}: {e}")
+        return None
+
+    for r in vals[1:]:
+        if len(r) >= 2 and str(r[0]).strip() == key:
+            return str(r[1]).strip()
+    return ""
+
+
+def _state_set(key, val):
+    """写状态页某个 key。写失败返回 False —— 下一轮可能重发一次，但不漏。"""
+    try:
+        wks = _get_state_sheet()
+        vals = wks.get_all_values()
+        for i, r in enumerate(vals[1:], start=2):
+            if len(r) >= 2 and str(r[0]).strip() == key:
+                wks.update(values=[[val]], range_name=f"B{i}", value_input_option="RAW")
+                return True
+        wks.append_row([key, val], value_input_option="RAW")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[opps_state] 写 {key} 失败: {type(e).__name__}: {e}")
+        return False
+
+
+def last_warmup_date():
+    """上次升温报告发送的北京日期（YYYY-MM-DD）。三态语义同 _state_get。"""
+    v = _state_get(STATE_KEY_WARMUP_DATE)
+    if v is None:
+        return None
+    return v[:10]
+
+
+def mark_warmup_sent(day):
+    """记录「今天已发升温报告」。写失败返回 False。"""
+    return _state_set(STATE_KEY_WARMUP_DATE, day)
+
+
 # ---- 行构造函数（两个信号共用，避免列序写两遍）----
 def _num(v, nd=1):
     try:

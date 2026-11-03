@@ -7,9 +7,10 @@
  *   而 workflow_dispatch 是同步入队、有明确返回码，不会丢。
  *   所以用 Cloudflare 的 Cron Trigger 主动调 dispatch，GitHub 自己的 cron 留作兜底。
  *
- * 两个 trigger（UTC，与 GitHub 的班次错开 15 分钟）
+ * 三个 trigger（UTC，都比 GitHub 自己那班晚 15~22 分钟，靠幂等闸去重）
  *   22 *\/6 * * *  → monitor.yml（主报告）    GitHub 自己是 07 分，每 6 小时
  *   52 *\/2 * * *  → opps.yml（机会扫描）     GitHub 自己是 37 分，仍每 2 小时
+ *   22 1  * * *    → warmup.yml（升温报告）   GitHub 自己是 00 分，每天 1 次
  *
  * 注意主报告是「每 6 小时」而不是每 2 小时：用户 2026-11-03 明确 2 小时一条太频繁，
  * 每天 4 条即可。opps 保持 2 小时是因为它每轮只写表、不推送（日报每天 1 条、
@@ -20,6 +21,10 @@
  *   距上次成功推送不足 90 分钟就整轮跳过，所以两边都触发也不会推两条。
  *   （GitHub :07 与 CF :22 只差 15 分钟，靠这道闸门去重。）
  *
+ *   ⚠️ warmup 例外：它跑在 main.py 那道闸**之前**（warmup 分支自己 return），
+ *   所以用的是另一道闸 —— 「当天已发过就跳过」（opps_state 的 last_warmup_date）。
+ *   否则每天会出现两条一模一样的升温报告。
+ *
  * 必需的环境变量（在 Worker 的 Settings → Variables and Secrets 里配）
  *   GH_TOKEN  fine-grained PAT，仅本仓库，权限只需 Actions: Read and write
  *   OWNER     lala1ala
@@ -29,6 +34,7 @@
 const WORKFLOWS = {
   '22 */6 * * *': 'monitor.yml',
   '52 */2 * * *': 'opps.yml',
+  '22 1 * * *': 'warmup.yml',
 };
 
 /**
@@ -50,6 +56,8 @@ function pickWorkflow(expr) {
 
   // 第一层容错：按「分」+「时」两个字段判断，忽略写法差异
   const [minute, hour] = key.split(' ');
+  // warmup 是单小时（每天一次），必须先判，否则会落到下面的通配规则里
+  if (minute === '22' && ['1', '01'].includes(hour)) return 'warmup.yml';
   if (minute === '22' && ['*/6', '0,6,12,18'].includes(hour)) return 'monitor.yml';
   if (minute === '52' && ['*/2', '0,2,4,6,8,10,12,14,16,18,20,22'].includes(hour)) {
     return 'opps.yml';
