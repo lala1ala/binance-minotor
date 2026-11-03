@@ -34,9 +34,10 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # 阈值 9h 的依据：radar 被 GitHub 丢调度后，实测"正常"空窗中位数约 6h、
-          # 最长约 8.94h。原值 6h 会让告警在正常节奏下就反复误报（昨天/今天各响一次）。
-          # 9h = 刚好覆盖已知最长正常空窗，同时真停机仍能在 9 小时内被发现。
-          DEADLETTER_WINDOW_HOURS: "9"
+          # 阈值 12h 的依据（2026-11-03 随 monitor 降频同步调整）：
+          # monitor 已从「每 2 小时」改为「每 6 小时」（4 次/天），正常间隔就是 6h，
+          # 叠加 GitHub 延迟 1–2h 后，原 9h 阈值会在完全正常的情况下反复误报。
+          # 12h = 两个调度周期，真停机仍能在半天内被发现。
+          DEADLETTER_WINDOW_HOURS: "12"
           PYTHONUNBUFFERED: "1"
         run: python deadletter.py

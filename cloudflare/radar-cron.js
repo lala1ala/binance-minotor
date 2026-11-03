@@ -8,12 +8,17 @@
  *   所以用 Cloudflare 的 Cron Trigger 主动调 dispatch，GitHub 自己的 cron 留作兜底。
  *
  * 两个 trigger（UTC，与 GitHub 的班次错开 15 分钟）
- *   22 *\/2 * * *  → monitor.yml（主报告）    GitHub 自己是 07 分
- *   52 *\/2 * * *  → opps.yml（机会扫描）     GitHub 自己是 37 分
+ *   22 *\/6 * * *  → monitor.yml（主报告）    GitHub 自己是 07 分，每 6 小时
+ *   52 *\/2 * * *  → opps.yml（机会扫描）     GitHub 自己是 37 分，仍每 2 小时
+ *
+ * 注意主报告是「每 6 小时」而不是每 2 小时：用户 2026-11-03 明确 2 小时一条太频繁，
+ * 每天 4 条即可。opps 保持 2 小时是因为它每轮只写表、不推送（日报每天 1 条、
+ * 爆空仅首次命中推），不会造成骚扰。
  *
  * 撞车了怎么办
  *   仓库里还有一道 90 分钟幂等闸（main.py 的 REPORT_MIN_GAP_MINUTES）：
  *   距上次成功推送不足 90 分钟就整轮跳过，所以两边都触发也不会推两条。
+ *   （GitHub :07 与 CF :22 只差 15 分钟，靠这道闸门去重。）
  *
  * 必需的环境变量（在 Worker 的 Settings → Variables and Secrets 里配）
  *   GH_TOKEN  fine-grained PAT，仅本仓库，权限只需 Actions: Read and write
@@ -22,7 +27,7 @@
  */
 
 const WORKFLOWS = {
-  '22 */2 * * *': 'monitor.yml',
+  '22 */6 * * *': 'monitor.yml',
   '52 */2 * * *': 'opps.yml',
 };
 
