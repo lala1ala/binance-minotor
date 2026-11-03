@@ -213,6 +213,54 @@ def mark_digest_sent(day):
         return False
 
 
+# ---- 主报告幂等：记录上次成功推送的时间戳 ----
+# 为什么需要：GitHub schedule 会丢班（实测交付约 3.7/12），所以外部定时器
+# （Cloudflare Worker Cron）会额外触发 workflow_dispatch 兜底。两边都触发时，
+# 不加闸就会同一时段推两条，并把账本的「扫描确认次数」重复 +1。
+# 与 last_digest_date 复用同一张 opps_state 页，只是 key 不同。
+STATE_KEY_REPORT_TS = "last_report_ts"
+
+
+def last_report_ts():
+    """上次主报告成功推送的 Unix 时间戳。
+
+    三态，调用方必须区分：
+      · float > 0 → 上次推送时刻
+      · 0         → 状态页正常但从未记录（首次上线）
+      · None      → **读失败**。此时应继续跑：宁可重复一次，不可漏推。
+    """
+    try:
+        vals = _get_state_sheet().get_all_values()
+    except Exception as e:  # noqa: BLE001
+        print(f"[opps_state] 读主报告状态失败: {type(e).__name__}: {e}")
+        return None
+
+    for r in vals[1:]:
+        if len(r) >= 2 and str(r[0]).strip() == STATE_KEY_REPORT_TS:
+            try:
+                return float(str(r[1]).strip())
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def mark_report_sent(ts):
+    """记录主报告推送时刻。写失败返回 False —— 下一轮可能重推一次，但不漏。"""
+    val = f"{float(ts):.0f}"
+    try:
+        wks = _get_state_sheet()
+        vals = wks.get_all_values()
+        for i, r in enumerate(vals[1:], start=2):
+            if len(r) >= 2 and str(r[0]).strip() == STATE_KEY_REPORT_TS:
+                wks.update(values=[[val]], range_name=f"B{i}", value_input_option="RAW")
+                return True
+        wks.append_row([STATE_KEY_REPORT_TS, val], value_input_option="RAW")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[opps_state] 写主报告状态失败: {type(e).__name__}: {e}")
+        return False
+
+
 # ---- 行构造函数（两个信号共用，避免列序写两遍）----
 def _num(v, nd=1):
     try:

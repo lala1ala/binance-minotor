@@ -85,6 +85,12 @@ class OIMonitor:
     MAX_WORKERS = 8            # 并发取数线程数
     SCAN_BUDGET_SECONDS = 600  # 单次扫描总时间预算（10 分钟），到点就用已有数据出报告
     ENRICH_BUDGET_SECONDS = 240  # 位置补算的**独立**预算，不再与扫描共用（见 enrich_positions 调用处）
+    # 主报告幂等窗口：距上次成功推送不足这么多分钟，本轮整轮跳过（不扫描、不推送、不写表）。
+    # 原因：GitHub schedule 会丢班，外部定时器（Cloudflare Worker）会额外触发 dispatch 兜底，
+    # 两边撞车时会把同一时段推两遍、账本「扫描确认次数」也会重复 +1。
+    # 设 90 分钟的逻辑：正常间隔 120 分钟；若上一班延迟触发，两者间隔可能缩到 30~60 分钟，
+    # 90 分钟足以挡住「同一班次的重复」，又不会误杀真正的下一班（120 分钟）。
+    REPORT_MIN_GAP_MINUTES = 90
     TELEGRAM_MAX_LEN = 4000    # Telegram 单条消息上限，超出自动分片
 
     # ---- 低位闸门参数（来自「买得便宜」的核心口径）----
@@ -1164,6 +1170,37 @@ def main():
             return
 
         # 报告模式：全指标扫描 >$10M 池子
+
+        # ---- 幂等闸：距上次成功推送不足 REPORT_MIN_GAP_MINUTES 就整轮跳过 ----
+        # GitHub schedule 会丢班（实测交付约 3.7/12），外部定时器（Cloudflare Worker）
+        # 会额外 dispatch 兜底；两边撞车时若不加闸，会同一时段推两条，
+        # 账本的「扫描确认次数」也会重复 +1。
+        # 放在扫描之前：跳过时省掉 600s 扫描预算，也不污染账本。
+        # FORCE_REPORT=1 可强制跑（手动排查用）。
+        # 状态用 Unix 时间戳而非本地时间：跨时区、跨机器一致（设备无关原则）。
+        try:
+            from opps_writer import last_report_ts, mark_report_sent
+        except Exception as e:  # noqa: BLE001
+            last_report_ts = mark_report_sent = None
+            logger.warning(f"[report] 幂等状态模块不可用，本轮不设闸: {type(e).__name__}: {e}")
+
+        if last_report_ts and os.getenv("FORCE_REPORT", "").strip() != "1":
+            try:
+                last_ts = last_report_ts()
+                if last_ts is None:
+                    logger.warning("[report] 读上次推送时间失败，本轮照跑（宁可重复，不漏推）")
+                elif last_ts > 0:
+                    gap_min = (time.time() - last_ts) / 60.0
+                    if gap_min < monitor.REPORT_MIN_GAP_MINUTES:
+                        logger.info(
+                            f"[report] 距上次推送 {gap_min:.0f} 分钟 < "
+                            f"{monitor.REPORT_MIN_GAP_MINUTES} 分钟，本轮整轮跳过"
+                            f"（判定为重复触发；强制跑请设 FORCE_REPORT=1）"
+                        )
+                        return
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[report] 幂等闸异常，本轮照跑: {type(e).__name__}: {e}")
+
         # 先「只读」一遍账本，拿到①今天已记到的确认次数 ②昨天在榜的币，
         # 供低位区打重复标注（⭐新 / 📌续 / 🔁×N）。推送在前、落表在后，
         # 所以推送时得先看现状再推算。读失败只是没标注，不影响扫描与推送。
@@ -1180,6 +1217,13 @@ def main():
         scan_result = monitor.scan_and_collect(threshold=10_000_000, ledger_state=ledger_state)
         monitor.send_telegram(scan_result['message'])
         logger.info("OI 报告发送成功")
+
+        # 只有推送成功才记时刻。推送抛异常时走不到这里 → 不记录 → 下一班能补推。
+        try:
+            if mark_report_sent:
+                mark_report_sent(time.time())
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[report] 记录推送时刻失败: {type(e).__name__}: {e}")
 
         # ★ 把「低位区」信号追加写入 Google Sheet 账本。
         #   只写前 10 列 + X「扫描确认次数」+ Y「DD(距1年高点%)」+ Z「价位分位%」，
