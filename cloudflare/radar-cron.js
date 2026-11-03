@@ -121,7 +121,8 @@ export default {
     if (!mapped) {
       console.error(
         `未知的 cron 表达式: "${event.cron}"（规范化后 "${normalizeCron(event.cron)}"）` +
-        `→ 兜底派发 ${workflow}，请检查 Cron Trigger 是否填成 22 */6 或 52 */2`
+        `→ 兜底派发 ${workflow}，请检查 Cron Trigger 应为 ` +
+        `22 */6（主报告）、52 */2（机会扫描）或 22 1（升温）之一`
       );
     }
     await dispatch(env, workflow);
