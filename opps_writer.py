@@ -142,6 +142,77 @@ def today():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+# ==================== 日报发送状态（2026-11-03 新增）====================
+# 为什么需要它：日报原来只挂在 workflow 的一条 cron（'7 1 * * *'）上。
+# 2026-11-03 该班次被 GitHub 直接丢掉（连 00:37Z 一起丢），结果一整天没有日报，
+# 而且没有任何告警 —— 定时日报从上线起一次都没成功发出过。
+#
+# 现在改成：北京 09:00 之后，**只要今天还没发过就发**。每 2 小时的班次都是重试机会。
+# 状态存在同一工作簿的 opps_state 页：
+#   · 跨机器（不依赖本机文件，符合「设备无关」原则）
+#   · 不加新依赖（复用已有 service account 与 SHEET_ID）
+STATE_TAB = "opps_state"
+STATE_KEY = "last_digest_date"
+
+
+def _get_state_sheet():
+    """取状态页；没有就建。读失败由调用方处理，这里直接抛。"""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    raw = os.environ.get("GSHEET_CREDENTIALS") or ""
+    if not raw.strip():
+        raise RuntimeError("GSHEET_CREDENTIALS 未设置")
+
+    creds = Credentials.from_service_account_info(
+        json.loads(raw), scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    sh = gspread.authorize(creds).open_by_key(SHEET_ID)
+    try:
+        return sh.worksheet(STATE_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        wks = sh.add_worksheet(title=STATE_TAB, rows=10, cols=2)
+        wks.append_row(["键", "值"], value_input_option="RAW")
+        return wks
+
+
+def last_digest_date():
+    """返回上次日报发送的北京日期（YYYY-MM-DD）。
+
+    三态返回，调用方必须区分：
+      · "YYYY-MM-DD" → 上次发送日
+      · ""           → 状态页正常但没有记录（首次上线）
+      · None         → **读失败**。此时应退回保守逻辑（只信 workflow 注入），
+                       否则 Sheet 一挂就会每 2 小时刷一条日报。
+    """
+    try:
+        vals = _get_state_sheet().get_all_values()
+    except Exception as e:  # noqa: BLE001
+        print(f"[opps_state] 读状态失败: {type(e).__name__}: {e}")
+        return None
+
+    for r in vals[1:]:
+        if len(r) >= 2 and str(r[0]).strip() == STATE_KEY:
+            return str(r[1]).strip()[:10]
+    return ""
+
+
+def mark_digest_sent(day):
+    """记录「今天已发」。写失败返回 False —— 下一班可能重发一次，但不漏发。"""
+    try:
+        wks = _get_state_sheet()
+        vals = wks.get_all_values()
+        for i, r in enumerate(vals[1:], start=2):
+            if len(r) >= 2 and str(r[0]).strip() == STATE_KEY:
+                wks.update(values=[[day]], range_name=f"B{i}", value_input_option="RAW")
+                return True
+        wks.append_row([STATE_KEY, day], value_input_option="RAW")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[opps_state] 写状态失败: {type(e).__name__}: {e}")
+        return False
+
+
 # ---- 行构造函数（两个信号共用，避免列序写两遍）----
 def _num(v, nd=1):
     try:

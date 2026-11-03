@@ -6,7 +6,7 @@ import random
 import logging
 import threading
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import firebase_admin
@@ -17,6 +17,16 @@ import tradfi_filter
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _join(*parts) -> str:
+    """用 " | " 连接非空段。
+
+    2026-11-03 加入：位置补算失败时不再输出「杠杆位:?」，而是整段省略。
+    没有这个函数，省略后会在行内留下 " | | " 或行首双空格。
+    """
+    return " | ".join(str(p) for p in parts if p)
+
 
 # ==================== 低位区「重复标注」 ====================
 def low_zone_mark(sym: str, ledger_state) -> str:
@@ -74,6 +84,7 @@ class OIMonitor:
                                # 8 个全挂降到 10%。找到 1 个活代理后整个扫描复用它）
     MAX_WORKERS = 8            # 并发取数线程数
     SCAN_BUDGET_SECONDS = 600  # 单次扫描总时间预算（10 分钟），到点就用已有数据出报告
+    ENRICH_BUDGET_SECONDS = 240  # 位置补算的**独立**预算，不再与扫描共用（见 enrich_positions 调用处）
     TELEGRAM_MAX_LEN = 4000    # Telegram 单条消息上限，超出自动分片
 
     # ---- 低位闸门参数（来自「买得便宜」的核心口径）----
@@ -587,11 +598,16 @@ class OIMonitor:
         candidate_syms = ([d['symbol'] for d in accumulation]
                           + [d['symbol'] for d in top_oi]
                           + [d['symbol'] for d in quiet[:30]])
-        # 补位共享同一个总预算：剩余时间不足就跳过补位，报告照发（标签显示「?」）
-        if overall_deadline - time.monotonic() > 30:
-            pos_map = self.enrich_positions(candidate_syms, deadline=overall_deadline)
-        else:
-            pos_map = {}
+        # 2026-11-03 修复「满屏问号」：补算改用**独立预算**，不再与扫描共用 overall_deadline。
+        # 原实现共用 600s，扫描一旦跑满（实测 run 41473209487：605.2s、89/109），
+        # 剩余预算为负 → 补算 100% 被跳过 → 整篇报告都是「杠杆位:? 价位:?」。
+        # 现在扫描最多 600s + 补算最多 240s = 840s，仍在 workflow 的 20 分钟超时内。
+        pos_map = self.enrich_positions(
+            candidate_syms, deadline=time.monotonic() + self.ENRICH_BUDGET_SECONDS
+        )
+        enrich_ok = bool(pos_map)
+        if candidate_syms and not enrich_ok:
+            logger.warning("位置补算未返回任何结果：本轮杠杆位/价位将整段省略")
         for d in all_metrics:
             pm = pos_map.get(d['symbol']) or {}
             yp, oip = pm.get('yp'), pm.get('oip')
@@ -604,18 +620,19 @@ class OIMonitor:
             d['is_oi_low'] = bool(oip and oip['is_low'])
 
         def pos_tag(d):
-            """位置标签，两个维度分开显示：杠杆位:8%🟢 价位:12%🟢"""
+            """位置标签，两个维度分开显示：杠杆位:8%🟢 价位:12%🟢
+
+            2026-11-03：算不出来就**整段省略**，不再打「?」。
+            满屏问号对用户零信息量（用户 11-03 原话：「都是问号 你发你妈呢」）。
+            真正的缺数据情况由报告底部的一行汇总提示，不逐行污染。
+            """
             parts = []
             if d.get('oi_pos') is not None:
                 parts.append(f"杠杆位:{d['oi_pos'] * 100:.0f}%"
                              + ("🟢" if d.get('is_oi_low') else ""))
-            else:
-                parts.append("杠杆位:?")
             if d.get('year_pos') is not None:
                 parts.append(f"价位:{d['year_pos'] * 100:.0f}%"
                              + ("🟢" if d.get('is_cheap') else ""))
-            else:
-                parts.append("价位:?")
             return " ".join(parts)
 
         # 用户核心口径：杠杆水位低 + OI 在缓慢累积 + 价格没怎么动
@@ -663,10 +680,11 @@ class OIMonitor:
         for d in low_zone[:8]:
             mk = low_zone_mark(d['symbol'], ledger_state)
             marked = marked or bool(mk)
-            dd = f" | DD{d['year_dd']:+.0f}%" if d.get('year_dd') is not None else ""
-            msg += (f"• `{d['symbol']}`{mk}: {pos_tag(d)}{dd} "
-                    f"| OI:24h {d['oi_chg_1d']:+.1f}% (2h {d['oi_chg']:+.1f}%) "
-                    f"| 价:{d['price_chg']:+.1f}%\n")
+            dd = f"DD{d['year_dd']:+.0f}%" if d.get('year_dd') is not None else ""
+            msg += (f"• `{d['symbol']}`{mk}: "
+                    + _join(pos_tag(d), dd,
+                            f"OI:24h {d['oi_chg_1d']:+.1f}% (2h {d['oi_chg']:+.1f}%)",
+                            f"价:{d['price_chg']:+.1f}%") + "\n")
         if marked:
             msg += ("   ⭐新=今日首现 ｜ 📌续=昨天也在榜 ｜ 🔁×N=今日第N次"
                     "（重复≠加分，看 OI 增幅/价格涨幅的配比）\n")
@@ -674,11 +692,15 @@ class OIMonitor:
         msg += "\n💎 **横盘 + 大户多 (OI 24h增>1.5% + LS>1.2 + 涨跌 −2%~+5%)**\n"
         if not accumulation: msg += "• 暂无匹配\n"
         for d in accumulation:
-            msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:24h {d['oi_chg_1d']:+.1f}% | LS:{d['ls']:.2f}\n"
+            msg += (f"• `{d['symbol']}`: "
+                    + _join(pos_tag(d), f"OI:24h {d['oi_chg_1d']:+.1f}%",
+                            f"LS:{d['ls']:.2f}") + "\n")
 
         msg += "\n📈 **2h OI 爆增榜**（脉冲，不是累积；回测显示单独看是负 alpha）\n"
         for d in top_oi:
-            msg += f"• `{d['symbol']}`: {pos_tag(d)} | OI:+{d['oi_chg']:.1f}% | LS:{d['ls']:.2f}\n"
+            msg += (f"• `{d['symbol']}`: "
+                    + _join(pos_tag(d), f"OI:+{d['oi_chg']:.1f}%",
+                            f"LS:{d['ls']:.2f}") + "\n")
 
         msg += "\n☢️ **极端费率**\n"
         for d in ext_neg:
@@ -702,6 +724,11 @@ class OIMonitor:
             #   ② 原写「低位埋伏」在本次改名后不存在了，此处应指「低位区」口径。
             msg += (f"📉 本次算过杠杆位的候选币中，有 {len(high_leverage)} 个 ≥90%；"
                     "杠杆已堆在近期高位，不属于「低位区（杠杆位≤25%）」的形状\n")
+
+        # 补算整体失败的提示：只出现一次，不逐行打「?」
+        if candidate_syms and not enrich_ok:
+            msg += ("\n⚠️ 本轮位置补算未完成，杠杆位/价位已省略"
+                    "（OI、费率、LS 等指标不受影响）\n")
 
         return {
             "message": msg,
@@ -1001,23 +1028,24 @@ class WarmupTracker:
             return ""
 
         def pos_str(r):
+            """2026-11-03：算不出来就整段省略，不再输出「杠杆位:?」。"""
             parts = []
             if r.get('oi_pos') is not None:
                 parts.append(f"杠杆位:{r['oi_pos'] * 100:.0f}%"
                              + ("🟢" if r.get('is_oi_low') else ""))
-            else:
-                parts.append("杠杆位:?")
             if r.get('year_pos') is not None:
                 parts.append(f"价位:{r['year_pos'] * 100:.0f}%"
                              + ("🟢" if r.get('is_cheap') else ""))
             return " ".join(parts)
 
         def line(r, extra=""):
-            s = (f"• `{r['symbol']}`: {pos_str(r)} | OI累计{r['oi_change']:+.1f}%"
-                 f" | 价{r['price_chg']:+.1f}% | 振幅{r['price_range']:.1f}%")
-            if extra:
-                s += f" | {extra}"
-            return s
+            return "• `{}`: ".format(r['symbol']) + _join(
+                pos_str(r),
+                f"OI累计{r['oi_change']:+.1f}%",
+                f"价{r['price_chg']:+.1f}%",
+                f"振幅{r['price_range']:.1f}%",
+                extra,
+            )
 
         groups = [
             ("bottom_start", "🟢 **【底部启动】低位 + OI 累积 + 价格平静**", lambda r: ""),
@@ -1091,12 +1119,42 @@ def main():
                 logger.error(f"[opps] 爆空扫描失败 {type(e).__name__}: {e}", exc_info=True)
 
             # ① 负费率持续性 + 低位（daidaibtc 2025-03-31）
-            # 每 2 小时只写表；每天北京 09:00 那一轮（workflow 注入 OPPS_DIGEST=1）
-            # 额外发一条日报，0 命中也发 —— 用户要的是「知道它今天跑了没有」。
+            # 每 2 小时都写表；日报在北京 09:00 之后发，0 命中也发
+            # —— 用户要的是「知道它今天跑了没有」。
+            #
+            # 2026-11-03 修复「日报丢班」：原来只有 workflow 的 '7 1 * * *' 一轮
+            # 带 OPPS_DIGEST=1，GitHub 把这个班次丢掉就一整天没有日报（11-03 实测已发生，
+            # 且连 00:37Z 一起丢）。现在改成「时间闸门 + 当天去重」：
+            # 09:00 之后任何一班发现今天还没发过，就发。状态存 Sheet 的 opps_state 页，
+            # 跨机器可用，不依赖本机文件。
             try:
                 from funding_lowzone import run as run_funding
-                notify = os.getenv("OPPS_DIGEST", "0").strip() == "1"
+                from opps_writer import last_digest_date, mark_digest_sent
+
+                bj_now = datetime.now(timezone.utc) + timedelta(hours=8)
+                bj_day = bj_now.strftime("%Y-%m-%d")
+                force = os.getenv("OPPS_DIGEST", "0").strip() == "1"  # 手动触发可强发
+                last_sent = last_digest_date()
+
+                if last_sent is None:
+                    # 状态读不到：退回保守逻辑（只信 workflow 注入），
+                    # 否则 Sheet 故障时每 2 小时刷一条日报。
+                    due = force
+                    logger.warning("[opps] 日报状态读取失败，本轮只按 OPPS_DIGEST 判断")
+                else:
+                    due = bj_now.hour >= 9 and last_sent != bj_day
+
+                notify = force or due
                 n = run_funding(monitor, notify=notify)
+
+                if notify:
+                    ok = mark_digest_sent(bj_day)
+                    logger.info(f"[opps] 日报已发（{bj_day}），状态写入{'成功' if ok else '失败'}")
+                else:
+                    logger.info(
+                        f"[opps] 不发日报：北京 {bj_now:%H:%M}，"
+                        f"上次发送 {last_sent or '无记录'}"
+                    )
                 logger.info(
                     f"[opps] 负费率观察完成，记录 {n} 个"
                     f"（{'日报轮' if notify else '仅记录'}）"
